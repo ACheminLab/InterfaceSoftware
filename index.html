@@ -1,0 +1,4497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Electrode-Electrolyte Interface Simulator</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Helvetica Neue, Arial, sans-serif; }
+    #root { min-height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    const { useState, useEffect, useRef, useCallback } = React;
+// ═══════════════════════════════════════════════════════════════════
+//  PHYSICAL CONSTANTS
+// ═══════════════════════════════════════════════════════════════════
+const e_C = 1.60218e-19;
+const k_B = 1.38065e-23;
+const eps0 = 8.85419e-12;
+const NA = 6.02214e23;
+
+// ═══════════════════════════════════════════════════════════════════
+//  ELECTROCHEMISTRY
+// ═══════════════════════════════════════════════════════════════════
+function muElectrolyte(pH) {
+  return -5.055 + 0.059 * pH;
+}
+function phiTotal(pH, WF_eV) {
+  return -WF_eV - muElectrolyte(pH);
+}
+function flatbandVoltage(pH, WF_eV) {
+  return 4.44 - WF_eV;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  BRENT ROOT-FINDER
+// ═══════════════════════════════════════════════════════════════════
+function brentq(f, a, b, tol = 1e-12, maxIter = 200) {
+  let fa = f(a),
+    fb = f(b);
+  if (fa * fb > 0) return (a + b) / 2;
+  if (Math.abs(fa) < Math.abs(fb)) {
+    [a, b] = [b, a];
+    [fa, fb] = [fb, fa];
+  }
+  let c = a,
+    fc = fa,
+    d = a,
+    mflag = true,
+    s;
+  for (let i = 0; i < maxIter; i++) {
+    if (Math.abs(b - a) < tol) break;
+    if (fa !== fc && fb !== fc) {
+      s = a * fb * fc / ((fa - fb) * (fa - fc)) + b * fa * fc / ((fb - fa) * (fb - fc)) + c * fa * fb / ((fc - fa) * (fc - fb));
+    } else {
+      s = b - fb * (b - a) / (fb - fa);
+    }
+    const cond1 = (s - (3 * a + b) / 4) * (s - b) > 0;
+    const cond2 = mflag && Math.abs(s - b) >= Math.abs(b - c) / 2;
+    const cond3 = !mflag && Math.abs(s - b) >= Math.abs(c - d) / 2;
+    const cond4 = mflag && Math.abs(b - c) < tol;
+    const cond5 = !mflag && Math.abs(c - d) < tol;
+    if (cond1 || cond2 || cond3 || cond4 || cond5) {
+      s = (a + b) / 2;
+      mflag = true;
+    } else {
+      mflag = false;
+    }
+    const fs = f(s);
+    d = c;
+    c = b;
+    fc = fb;
+    if (fa * fs < 0) {
+      b = s;
+      fb = fs;
+    } else {
+      a = s;
+      fa = fs;
+    }
+    if (Math.abs(fa) < Math.abs(fb)) {
+      [a, b] = [b, a];
+      [fa, fb] = [fb, fa];
+    }
+  }
+  return b;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SEMICONDUCTOR PHYSICS  (Gouy-Chapman + Mott-Schottky)
+// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+//  SURFACE TRAPPED CHARGE (surface states)
+//  Discrete trap level at E_t above the surface VBM.
+//  Band convention (see getBandProfile_SC):
+//    E_F = −WF (flat);  E_vac(x) = Φ_total − φ(x);  E_VBM = E_vac − χ − Eg
+//    ξ_bulk = E_F − E_VBM(bulk) = −WF + χ + Eg
+//    ξ_surf = ξ_bulk − φ_s          (band bending raises/lowers surface VBM)
+//  Occupancy (Fermi-Dirac):  f = 1 / (1 + exp((E_t − ξ_surf)/kT))
+//  Charge:
+//    acceptor-like: neutral empty, −e when filled  →  Q_ss = −e·N·f
+//    donor-like:    +e when empty, neutral filled  →  Q_ss = +e·N·(1−f)
+//  Because Q_ss depends on φ_s, it enters the balance self-consistently
+//  and reproduces Fermi-level pinning at large N.
+// ═══════════════════════════════════════════════════════════════════
+function surfaceTrapCharge(phi_s, traps, T) {
+  if (!traps || !(traps.N_m2 > 0)) return 0;
+  const kT = k_B * T / e_C; // eV
+  const xi_surf = traps.xi_bulk_eV - phi_s; // E_F − E_VBM at surface [eV]
+  const dE = (traps.E_t_eV - xi_surf) / kT;
+  const f = 1 / (1 + Math.exp(Math.max(-200, Math.min(200, dE))));
+  return traps.type === "donor" ? e_C * traps.N_m2 * (1 - f) : -e_C * traps.N_m2 * f;
+}
+function findVH_SC(NA_m3, c0_m3, Phi_total, eps_s, eps_f, T, sigma_surf = 0, traps = null) {
+  const lo = Math.max(-Math.abs(Phi_total) + 1e-6, -0.9999);
+  const hi = Math.min(Math.abs(Phi_total) - 1e-6, 0.9999);
+  if (lo >= hi) return 0;
+  const balance = Vh => {
+    const phi_s = Phi_total - Vh;
+    const Q_solid = Math.sign(phi_s) * Math.sqrt(2 * e_C * NA_m3 * eps_s * Math.abs(phi_s));
+    const Q_liquid = -Math.sqrt(8 * eps_f * k_B * T * c0_m3) * Math.sinh(e_C * Vh / (2 * k_B * T));
+    const Q_ss = surfaceTrapCharge(phi_s, traps, T);
+    return Q_solid + Q_liquid + sigma_surf + Q_ss;
+  };
+  return brentq(balance, lo, hi);
+}
+function getProfile_SC(V_H, NA_m3, c0_m3, Phi_total, eps_s, eps_f, T, N_pts = 400) {
+  const kappa = Math.sqrt(2 * e_C * e_C * c0_m3 / (eps_f * k_B * T));
+  const lambda_D = 1 / kappa; // Debye length [m]
+  const phi_s = Phi_total - V_H;
+  const W = Math.sqrt(2 * eps_s * Math.abs(phi_s) / (e_C * NA_m3));
+  const gamma = Math.tanh(e_C * V_H / (4 * k_B * T));
+
+  // Liquid side: show exactly 2 Debye lengths
+  const liqSpan = Math.max(2 * lambda_D, 0.5e-9);
+  // Solid side: show 1.5×W beyond interface (min 2 nm), rounded up to 0.5 nm
+  const solSpanRaw = Math.max(1.5 * W, 2e-9);
+  const solSpan = Math.ceil(solSpanRaw * 2e9) / 2e9; // round up to 0.5 nm
+
+  const liqPts = [],
+    solPts = [];
+  for (let i = 0; i < N_pts; i++) {
+    const x = -liqSpan * (1 - i / (N_pts - 1));
+    const arg = gamma * Math.exp(kappa * x);
+    const phi = arg >= 1 || arg <= -1 ? Math.sign(arg) * 4 * k_B * T / e_C * 15 : 4 * k_B * T / e_C * Math.atanh(arg);
+    liqPts.push({
+      x: x * 1e9,
+      phi: phi * 1000
+    });
+  }
+  // Generate solid points all the way to solSpan so the curve reaches xMax
+  for (let i = 0; i < N_pts; i++) {
+    const x = solSpan * i / (N_pts - 1);
+    const phi = x <= W ? (Phi_total - phi_s * ((W - x) / W) ** 2) * 1000 : Phi_total * 1000;
+    solPts.push({
+      x: x * 1e9,
+      phi
+    });
+  }
+  return {
+    liq: liqPts,
+    sol: solPts,
+    W_nm: W * 1e9,
+    V_H_mV: V_H * 1000,
+    phi_s_mV: phi_s * 1000,
+    xMin_nm: -liqSpan * 1e9,
+    xMax_nm: solSpan * 1e9,
+    lambda_D_nm: lambda_D * 1e9
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  METAL PHYSICS  (all drop at Helmholtz + diffuse layer, flat bulk)
+//
+//  For a metal the electrode has no space-charge region. The system
+//  is fully determined by Φ_total = phiTotal(pH, WF):
+//    • φ(x > 0) = Φ_total  (perfect conductor, flat everywhere)
+//    • The Gouy-Chapman diffuse layer carries exactly Q_diffuse = −Q_metal
+//    • V_H = Φ_total  (entire potential drops in solution)
+//    • σ_surf is NOT a free parameter — it is set by the thermodynamics
+//      of the equilibrium: Q_metal = −Q_diffuse(Φ_total)
+//  The only free inputs are pH, Φ_WF (→ Φ_total), c₀, and T.
+// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+//  METAL — GOUY-CHAPMAN with AUTO-STERN
+//  Saturation criterion: GC surface concentration > 3D close-packing
+//    c_surf = c₀·exp(|eΦ/kT|)  vs  n_max_3D = 1/(4√2·r_solv³)
+//  When saturated:
+//    σ_Stern = −sign(Φ)·n_max_2D·e   [n_max_2D = 1/(2√3·r_solv²)]
+//    Stern plane at x = −r_solv (OHP)
+//    Solve: V_diff + (σ_Stern + Q₀·sinh(eV_diff/2kT))/C_H = Φ_total
+//    C_H = ε_H·ε₀ / r_solv
+// ═══════════════════════════════════════════════════════════════════
+function getProfile_Metal(c0_m3, Phi_total, eps_f, T, r_solv_nm, eps_H, N_pts = 400) {
+  const kappa = Math.sqrt(2 * e_C * e_C * c0_m3 / (eps_f * k_B * T));
+  const lambda_D = 1 / kappa;
+  const Q0 = Math.sqrt(8 * eps_f * k_B * T * c0_m3);
+  const liqSpan = Math.max(2 * lambda_D, 0.5e-9);
+  const r_m = r_solv_nm * 1e-9;
+
+  // ── Saturation check ─────────────────────────────────────────────
+  // Surface concentration of counter-ions at GC OHP (pure GC, V_H = Phi_total)
+  const c_surf_GC = c0_m3 * Math.exp(Math.min(50, Math.abs(e_C * Phi_total / (k_B * T))));
+  const n_max_3D = 1 / (4 * Math.sqrt(2) * r_m * r_m * r_m); // HCP packing [m⁻³]
+  const autoStern = c_surf_GC > n_max_3D;
+  let V_diff, V_stern_v;
+  const C_H = eps_H * eps0 / r_m; // F/m²
+
+  if (autoStern) {
+    // Standard GCS: V_diff + Q_GC(V_diff)/C_H = Phi_total (no fixed σ_Stern)
+    // d = r_solv sets the capacitance; surface concentration is limited naturally.
+    const f = Vd => Vd + Q0 * Math.sinh(Math.max(-200, Math.min(200, e_C * Vd / (2 * k_B * T)))) / C_H - Phi_total;
+    V_diff = Math.abs(Phi_total) < 1e-6 ? 0 : brentq(f, -Math.abs(Phi_total) * 3 - 1, Math.abs(Phi_total) * 3 + 1);
+    V_stern_v = Phi_total - V_diff;
+  } else {
+    V_diff = Phi_total;
+    V_stern_v = 0;
+  }
+  const gamma = Math.tanh(e_C * V_diff / (4 * k_B * T));
+  const Q_metal = Q0 * Math.sinh(Math.max(-200, Math.min(200, e_C * V_diff / (2 * k_B * T))));
+  const liqPts = [];
+  const N_diff = autoStern ? Math.round(N_pts * 0.85) : N_pts;
+  for (let i = 0; i < N_diff; i++) {
+    const x_gc = -liqSpan * (1 - i / (N_diff - 1));
+    const x = x_gc - (autoStern ? r_m : 0);
+    const arg = gamma * Math.exp(kappa * x_gc);
+    const phi = arg >= 1 || arg <= -1 ? Math.sign(arg) * 4 * k_B * T / e_C * 15 : 4 * k_B * T / e_C * Math.atanh(arg);
+    liqPts.push({
+      x: x * 1e9,
+      phi: phi * 1000
+    });
+  }
+  if (autoStern) {
+    // Stern region: linear from V_diff (at OHP = x=−r_solv) to Phi_total (at IHP = x=0)
+    for (let i = 0; i <= 20; i++) {
+      const t = i / 20;
+      liqPts.push({
+        x: (-r_m + r_m * t) * 1e9,
+        phi: (V_diff + V_stern_v * t) * 1000
+      });
+    }
+  }
+  const solPts = [];
+  for (let i = 0; i <= 20; i++) solPts.push({
+    x: 2e-9 * i / 20 * 1e9,
+    phi: Phi_total * 1000
+  });
+  return {
+    liq: liqPts,
+    sol: solPts,
+    W_nm: 0,
+    V_H_mV: autoStern ? V_stern_v * 1000 : Phi_total * 1000,
+    V_diff_mV: autoStern ? V_diff * 1000 : null,
+    phi_s_mV: 0,
+    Q_metal_Cm2: Q_metal,
+    xMin_nm: -(liqSpan + (autoStern ? r_m : 0)) * 1e9,
+    xMax_nm: 2,
+    lambda_D_nm: lambda_D * 1e9,
+    d_nm: autoStern ? r_solv_nm : 0,
+    autoStern,
+    C_H_uFcm2: autoStern ? C_H * 1e-4 * 1e6 : null
+  };
+}
+
+// ─── Dynamic charge formatter: C/m² → auto-range to μC/cm², mC/m², etc.
+function fmtCharge(Q_Cm2) {
+  // Convert to μC/cm²: 1 C/m² = 100 μC/cm²
+  const uCcm2 = Q_Cm2 * 100 * 1e6; // = Q_Cm2 * 1e8 μC/cm²
+  // Actually: 1 C/m² = 1e4 μC/m² = 100 μC/cm²... let's be careful:
+  // 1 C/m² × (1 m² / 1e4 cm²) = 1e-4 C/cm² = 100 μC/cm²  ✓
+  const val_uCcm2 = Q_Cm2 * 1e2; // μC/cm²  (1 C/m² = 100 μC/cm²)
+  const abs = Math.abs(val_uCcm2);
+  if (abs === 0) return {
+    val: "0",
+    unit: "μC/cm²"
+  };
+  if (abs >= 1e3) return {
+    val: (val_uCcm2 / 1e3).toFixed(3),
+    unit: "mC/cm²"
+  };
+  if (abs >= 1) return {
+    val: val_uCcm2.toFixed(3),
+    unit: "μC/cm²"
+  };
+  if (abs >= 1e-3) return {
+    val: (val_uCcm2 * 1e3).toFixed(3),
+    unit: "nC/cm²"
+  };
+  return {
+    val: (val_uCcm2 * 1e6).toFixed(3),
+    unit: "pC/cm²"
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+function getBandProfile_SC(curve, chi_eV, Eg_eV, WF_eV, N_pts = 300) {
+  if (!curve) return null;
+  const ef = -WF_eV;
+  const vacAt = phi_mV => curve.phiTotal - phi_mV / 1000;
+  const stride = Math.max(1, Math.ceil(curve.sol.length / N_pts));
+  const solPts = curve.sol.filter((_, i) => i % stride === 0).map(p => {
+    const vac = vacAt(p.phi);
+    return {
+      x: p.x,
+      vac,
+      cbm: vac - chi_eV,
+      vbm: vac - chi_eV - Eg_eV
+    };
+  });
+  const liqPts = curve.liq.filter((_, i) => i % stride === 0).map(p => ({
+    x: p.x,
+    vac: vacAt(p.phi)
+  }));
+  const vacLiqBulk = curve.phiTotal;
+  const toSHE = E_eV => vacLiqBulk - E_eV - 4.44;
+  return {
+    solPts,
+    liqPts,
+    ef,
+    toSHE
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  METAL BAND DIAGRAM PHYSICS
+//  Metal: flat E_F = −WF everywhere in solid.
+//  E_vac(solid) = 0 (our convention: vacuum of bulk metal = reference).
+//  The metal is a perfect conductor → φ(x>0) = Φ_total → E_vac(x>0) shifts uniformly.
+//  We show E_F as a flat line, E_vac slightly above it (= WF), and hatching for the bulk.
+// ═══════════════════════════════════════════════════════════════════
+function getBandProfile_Metal(curve, WF_eV, N_pts = 300) {
+  if (!curve) return null;
+  const ef = -WF_eV;
+  const vacAt = phi_mV => curve.phiTotal - phi_mV / 1000;
+  const stride = Math.max(1, Math.ceil(curve.liq.length / N_pts));
+  // Metal solid side: E_vac is flat at (Φ_total − Φ_total) = 0
+  // Actually E_vac(x>0) = curve.phiTotal − φ(x>0) = 0 since φ = Φ_total everywhere
+  const solPts = curve.sol.filter((_, i) => i % stride === 0).map(p => {
+    const vac = vacAt(p.phi); // = 0 since p.phi = Φ_total*1000
+    return {
+      x: p.x,
+      vac
+    };
+  });
+  const liqPts = curve.liq.filter((_, i) => i % stride === 0).map(p => ({
+    x: p.x,
+    vac: vacAt(p.phi)
+  }));
+  const vacLiqBulk = curve.phiTotal;
+  const toSHE = E_eV => vacLiqBulk - E_eV - 4.44;
+  return {
+    solPts,
+    liqPts,
+    ef,
+    toSHE
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  COLOURS / CONSTANTS
+// ═══════════════════════════════════════════════════════════════════
+const MODES_SC = [{
+  id: "free",
+  label: "Free exploration"
+}];
+const MODES_METAL = [{
+  id: "free",
+  label: "Free exploration"
+}];
+const PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"];
+const PH_VALS = [0, 3, 7, 10, 14];
+const PH_COLORS = ["#d62728", "#e07030", "#2ca02c", "#1f77b4", "#6a3d9a"];
+const NA_VALS = [1e14, 1e17, 1e20, 1e22];
+const WF_VALS = [3.5, 4.0, 4.5, 5.0, 5.5];
+const WF_COLORS = ["#d62728", "#e07030", "#2ca02c", "#1f77b4", "#6a3d9a"];
+const C0_VALS = [1e-5, 1e-3, 0.1, 1.0];
+const SIGMAS = [-1e15, -1e14, -1e13, 0, 1e13, 1e14, 1e15];
+const SIGMA_COLS = ["#1f4fa8", "#1f77b4", "#7fb6d8", "#7f7f7f", "#e89c9e", "#d62728", "#8b0000"];
+
+// ═══════════════════════════════════════════════════════════════════
+//  THEME
+// ═══════════════════════════════════════════════════════════════════
+const LIGHT = {
+  bg: "#f0f4f8",
+  surface: "#ffffff",
+  surfaceB: "#f6f9fc",
+  border: "#cdd5e0",
+  header: "#0d2137",
+  headerTxt: "#e8f4ff",
+  subhead: "#132d48",
+  accent: "#1a6fa8",
+  muted: "#7a8fa8",
+  text: "#0d2137",
+  textSub: "#556",
+  grid: "#d0d8e4",
+  liqBg: "#e4f0fc",
+  solBg: "#f5f0e8",
+  metalBg: "#e8e8ec",
+  pill: "#f4f8ff"
+};
+const DARK = {
+  bg: "#0b1623",
+  surface: "#111e2d",
+  surfaceB: "#162333",
+  border: "#243547",
+  header: "#060f1a",
+  headerTxt: "#c8e0f4",
+  subhead: "#0d1e2e",
+  accent: "#4da6e0",
+  muted: "#4f6a82",
+  text: "#d0e8f8",
+  textSub: "#8aacca",
+  grid: "#1e3045",
+  liqBg: "#0d2035",
+  solBg: "#1a160a",
+  metalBg: "#1a1a24",
+  pill: "#0d1e30"
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  CHARGE DENSITY STRIP
+// ═══════════════════════════════════════════════════════════════════
+function ChargeStrip({
+  curves,
+  xMin_nm,
+  xMax_nm,
+  width,
+  dark,
+  isMetal,
+  padL,
+  padR,
+  c0_M,
+  NA_cm3,
+  Temp,
+  sigmaRaw,
+  rIon_A,
+  rSolv_A
+}) {
+  const STRIP_H = 70;
+  const plotW = width - padL - padR;
+  const N_COLS = Math.max(80, Math.floor(plotW));
+  const kT_eV = k_B * Temp / e_C;
+  const c0_m3 = c0_M * 1e3 * NA;
+  const NA_m3 = NA_cm3 * 1e6;
+  if (!curves.length) return null;
+  const curve = curves[0];
+  const xSpan = xMax_nm - xMin_nm;
+  const ifFrac = -xMin_nm / xSpan;
+  const ifX = padL + ifFrac * plotW;
+
+  // φ interpolator
+  const allPts = [...curve.liq, ...curve.sol].sort((a, b) => a.x - b.x);
+  const interpPhi = x_nm => {
+    let lo = 0,
+      hi = allPts.length - 1;
+    while (lo < hi - 1) {
+      const mid = lo + hi >> 1;
+      allPts[mid].x <= x_nm ? lo = mid : hi = mid;
+    }
+    const p0 = allPts[lo],
+      p1 = allPts[hi];
+    if (p0 === p1 || p1.x === p0.x) return p0.phi / 1000;
+    return (p0.phi + (x_nm - p0.x) / (p1.x - p0.x) * (p1.phi - p0.phi)) / 1000;
+  };
+
+  // ρ columns
+  const phiSsgn = curve.phi_s_mV !== undefined ? Math.sign(curve.phi_s_mV) : -1;
+  const liqCols = [],
+    solCols = [];
+  for (let ci = 0; ci < N_COLS; ci++) {
+    const x_nm = xMin_nm + xSpan * ci / (N_COLS - 1);
+    const phi_V = interpPhi(x_nm);
+    if (x_nm <= 0) {
+      const sh = Math.sinh(Math.max(-20, Math.min(20, phi_V / kT_eV)));
+      liqCols.push({
+        ci,
+        x_nm,
+        rho: -2 * c0_m3 * sh
+      });
+    } else {
+      const inSCR = !isMetal && curve.W_nm > 0 && x_nm < curve.W_nm;
+      solCols.push({
+        ci,
+        x_nm,
+        rho: inSCR ? phiSsgn * NA_m3 : 0
+      });
+    }
+  }
+
+  // Background gradient (independent normalisation per side)
+  const liqMax = Math.max(1e-10, ...liqCols.map(c => Math.abs(c.rho)));
+  const solMax = isMetal ? 1 : Math.max(1e-10, ...solCols.map(c => Math.abs(c.rho)));
+  const normL = r => Math.max(-1, Math.min(1, r / liqMax));
+  const normS = r => Math.max(-1, Math.min(1, r / solMax));
+  const colMap = n => {
+    const a = 0.06 + 0.70 * Math.abs(n);
+    if (n > 0) return "rgba(210,60,50," + a.toFixed(2) + ")";
+    if (n < 0) return "rgba(40,80,210," + a.toFixed(2) + ")";
+    return "rgba(120,120,120,0.04)";
+  };
+
+  // Physical scale — both other dims = xSpan_nm
+  const dx_nm = xSpan / (N_COLS - 1);
+  const cross_nm = xSpan;
+  const V_col_nm3 = dx_nm * cross_nm * cross_nm;
+  const colW = plotW / N_COLS;
+
+  // Ion radii in pixels (strip height = cross_nm physical)
+  const rIon_nm = (rIon_A || 1.5) * 0.1; // nm
+  const rSolv_nm = (rSolv_A || 3.5) * 0.1; // nm
+  // Use x-axis scale (plotW/xSpan) so ions appear correctly sized vs the nm ruler
+  const px_per_nm_x = plotW / xSpan;
+  const R_bare = Math.max(2, Math.min(Math.round(STRIP_H * 0.28), Math.round(rIon_nm * px_per_nm_x)));
+  const R_solv = Math.max(R_bare + 1, Math.min(Math.round(STRIP_H * 0.42), Math.round(rSolv_nm * px_per_nm_x)));
+
+  // Wang hash
+  const wang = n => {
+    n = (n ^ 61 ^ n >>> 16) >>> 0;
+    n = n + (n << 3) >>> 0;
+    n = (n ^ n >>> 4) >>> 0;
+    n = Math.imul(n, 0x27d4eb2d) >>> 0;
+    return ((n ^ n >>> 15) >>> 0) / 0x100000000;
+  };
+
+  // Raw physical counts
+  const liqRaw = liqCols.map(({
+    rho
+  }) => Math.abs(rho) / e_C * 1e-27 * V_col_nm3);
+  const liq_raw_tot = liqRaw.reduce((s, v) => s + v, 0);
+  const NA_nm3 = NA_m3 * 1e-27;
+  const scDep = solCols.filter(c => !isMetal && (curve.W_nm || 0) > 0 && c.x_nm < curve.W_nm);
+  const sc_raw_tot = scDep.length * NA_nm3 * V_col_nm3;
+
+  // Unified scale — same factor for both sides, MIN_VIS floor
+  const MAX_SIDE = 35,
+    MIN_VIS = 5;
+  let N_liq_eff = 0,
+    N_SC_eff = 0;
+  const hasLiq = liq_raw_tot > 1e-15,
+    hasSC = sc_raw_tot > 1e-15;
+  if (hasLiq || hasSC) {
+    const maxRaw = Math.max(hasLiq ? liq_raw_tot : 0, hasSC ? sc_raw_tot : 0);
+    const minNonZ = Math.min(hasLiq ? liq_raw_tot : 1e30, hasSC ? sc_raw_tot : 1e30);
+    let eff = MAX_SIDE / maxRaw;
+    if (minNonZ < 1e30 && minNonZ * eff < MIN_VIS) eff = MIN_VIS / minNonZ;
+    const bigAfter = maxRaw * eff;
+    if (bigAfter > 2 * MAX_SIDE) eff *= 2 * MAX_SIDE / bigAfter;
+    N_liq_eff = liq_raw_tot * eff;
+    N_SC_eff = sc_raw_tot * eff;
+  }
+
+  // ── LIQUID ions: band-based placement, dual-circle rendering ─────
+  const liqIons = [];
+  liqCols.forEach(({
+    ci,
+    rho
+  }, idx) => {
+    const weight = liq_raw_tot > 1e-15 ? liqRaw[idx] / liq_raw_tot : 0;
+    const N_float = N_liq_eff * weight;
+    const nPlace = Math.floor(N_float) + (wang(ci * 997 + idx * 53 + 7 >>> 0) < N_float % 1 ? 1 : 0);
+    if (nPlace === 0) return;
+    const sx = padL + ci * plotW / (N_COLS - 1);
+    const pos = rho > 0;
+    const bandH = (STRIP_H - 2 * R_solv - 2) / nPlace;
+    for (let s = 0; s < nPlace; s++) {
+      const rx = wang(ci * 131 + s * 1013 + 5 >>> 0);
+      const ry = wang(ci * 991 + s * 499 + 11 >>> 0);
+      liqIons.push({
+        px: sx - colW * 2.5 + rx * colW * 5.0,
+        py: R_solv + 1 + s * bandH + ry * bandH * 0.85,
+        pos
+      });
+    }
+  });
+
+  // ── SC dopants: physical lattice diamonds ─────────────────────────
+  const N_SC_disp = Math.floor(N_SC_eff) + (wang(Math.round(N_SC_eff * 1000) + 1337 >>> 0) < N_SC_eff % 1 ? 1 : 0);
+  const DOPE_R = Math.max(3, Math.round(STRIP_H * 0.07));
+  const dopants = [];
+  if (!isMetal && N_SC_disp > 0 && (curve.W_nm || 0) > 0) {
+    const pxStart = padL + -xMin_nm / xSpan * plotW;
+    const pxEnd = padL + (curve.W_nm - xMin_nm) / xSpan * plotW;
+    const W_px = Math.max(1, pxEnd - pxStart);
+    const aspect = W_px / STRIP_H;
+    const nC = Math.max(1, Math.round(Math.sqrt(N_SC_disp * aspect)));
+    const nR = Math.max(1, Math.round(N_SC_disp / nC));
+    const a_x = W_px / nC;
+    const a_y = (STRIP_H - 2 * DOPE_R) / Math.max(1, nR);
+    const pos2 = phiSsgn > 0;
+    for (let col = 0; col < nC; col++) for (let row = 0; row < nR; row++) {
+      const stagger = row % 2 === 0 ? 0 : a_x * 0.5;
+      const px = pxStart + (col + 0.5) * a_x + stagger;
+      const py = DOPE_R + (row + 0.5) * a_y;
+      if (px > pxEnd + DOPE_R) continue;
+      dopants.push({
+        px,
+        py,
+        pos: pos2
+      });
+    }
+  }
+
+  // ── STERN layer: hex-packed adsorption sites with coverage fraction ─
+  // Ions adsorb at the IHP (x=0). Max 2D packing: n_max = 1/(2√3·rSolv²) nm⁻²
+  // Coverage fraction f = |σ_Stern|/(e_C) / n_max = actual vs maximum
+  const sternSites = [];
+  if (isMetal && curve.d_nm > 0) {
+    const sxOHP = padL + (-curve.d_nm - xMin_nm) / xSpan * plotW;
+    const n_max_nm2 = 1 / (2 * Math.sqrt(3) * rSolv_nm * rSolv_nm);
+    const sigma_abs = Math.abs(curve.Q_metal_Cm2 || 0); // C/m²
+    const n_ads_nm2 = sigma_abs / e_C * 1e-18; // nm⁻²
+    const coverage = Math.min(1, n_max_nm2 > 0 ? n_ads_nm2 / n_max_nm2 : 0);
+    const stern_pos = (curve.Q_metal_Cm2 || 0) < 0; // adsorbed ion sign = opposite metal
+    const R_s = Math.max(3, R_solv);
+    const dx_hex = R_s * 2.0;
+    const dy_hex = R_s * Math.sqrt(3);
+    for (let col = 0; sxOHP + (col + 0.5) * dx_hex < ifX; col++) {
+      for (let row = 0; R_s + row * dy_hex < STRIP_H + R_s; row++) {
+        const stagger = row % 2 === 0 ? 0 : dx_hex * 0.5;
+        const px = sxOHP + (col + 0.5) * dx_hex + stagger;
+        const py = R_s + row * dy_hex;
+        if (px > ifX || py > STRIP_H + R_s) continue;
+        const occ = wang(col * 1009 + row * 7919 + 42 >>> 0) < coverage;
+        sternSites.push({
+          px,
+          py,
+          occ,
+          pos: stern_pos
+        });
+      }
+    }
+  }
+
+  // Surface charge markers
+  // Total surface sheet = fixed σ_surf + trapped charge Q_ss
+  const sigTot_Cm2 = curve.sigmaTot_Cm2 != null ? curve.sigmaTot_Cm2 : sigmaRaw * 1e13 * 1e4 * e_C;
+  const scSurfSign = !isMetal && Math.abs(sigTot_Cm2) > 1e-6 ? Math.sign(sigTot_Cm2) : 0;
+  const metalSurfQ = isMetal ? curve.Q_metal_Cm2 || 0 : 0;
+  const metalSurfSign = isMetal ? Math.sign(metalSurfQ) : 0;
+  const T = dark ? DARK : LIGHT;
+
+  // Colour helpers
+  const ionFill = pos => pos ? dark ? "rgba(220,80,60,0.88)" : "rgba(200,50,40,0.82)" : dark ? "rgba(60,100,230,0.88)" : "rgba(40,70,210,0.82)";
+  const ionStr = pos => pos ? dark ? "rgba(255,160,140,0.5)" : "rgba(150,20,10,0.4)" : dark ? "rgba(130,170,255,0.5)" : "rgba(10,30,160,0.4)";
+  const solvStr = pos => pos ? dark ? "rgba(255,140,120,0.35)" : "rgba(180,40,20,0.25)" : dark ? "rgba(120,160,255,0.35)" : "rgba(20,50,200,0.25)";
+  return /*#__PURE__*/React.createElement("svg", {
+    width: width,
+    height: STRIP_H + 2,
+    style: {
+      display: "block",
+      overflow: "visible"
+    }
+  }, /*#__PURE__*/React.createElement("rect", {
+    x: padL,
+    y: 0,
+    width: Math.max(0, ifX - padL),
+    height: STRIP_H,
+    fill: dark ? "rgba(20,40,70,0.55)" : "rgba(220,235,250,0.55)",
+    rx: "2"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: ifX,
+    y: 0,
+    width: Math.max(0, padL + plotW - ifX),
+    height: STRIP_H,
+    fill: dark ? "rgba(40,30,10,0.4)" : "rgba(245,238,225,0.4)",
+    rx: "2"
+  }), [...liqCols, ...solCols].sort((a, b) => a.ci - b.ci).map(({
+    ci,
+    rho,
+    x_nm
+  }) => {
+    const n = x_nm <= 0 ? normL(rho) : normS(rho);
+    const sx = padL + ci * plotW / (N_COLS - 1);
+    const cw = Math.ceil(colW) + 1;
+    return /*#__PURE__*/React.createElement("rect", {
+      key: ci,
+      x: sx - cw / 2,
+      y: 1,
+      width: cw,
+      height: STRIP_H - 2,
+      fill: colMap(n),
+      shapeRendering: "crispEdges"
+    });
+  }), sternSites.map((s, i) => {
+    if (!s.occ) return /*#__PURE__*/React.createElement("circle", {
+      key: "se-" + i,
+      cx: s.px,
+      cy: s.py,
+      r: R_solv,
+      fill: "none",
+      stroke: dark ? "rgba(180,96,159,0.35)" : "rgba(140,60,130,0.3)",
+      strokeWidth: "0.7",
+      strokeDasharray: "3,2"
+    });
+    return /*#__PURE__*/React.createElement("g", {
+      key: "so-" + i
+    }, /*#__PURE__*/React.createElement("circle", {
+      cx: s.px,
+      cy: s.py,
+      r: R_solv,
+      fill: dark ? "rgba(176,96,159,0.22)" : "rgba(176,96,159,0.15)",
+      stroke: "#b0609f",
+      strokeWidth: "0.8",
+      strokeDasharray: "3,2"
+    }), /*#__PURE__*/React.createElement("circle", {
+      cx: s.px,
+      cy: s.py,
+      r: R_bare,
+      fill: ionFill(s.pos),
+      stroke: ionStr(s.pos),
+      strokeWidth: "0.7"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: s.px,
+      y: s.py,
+      textAnchor: "middle",
+      dominantBaseline: "middle",
+      fontSize: R_bare * 1.05,
+      fontWeight: "900",
+      fill: "rgba(255,255,255,0.95)",
+      fontFamily: "'DM Mono',monospace",
+      style: {
+        userSelect: "none"
+      }
+    }, s.pos ? "+" : "−"));
+  }), dopants.map((d, i) => {
+    const r = DOPE_R;
+    const path = "M" + d.px + "," + (d.py - r) + " L" + (d.px + r) + "," + d.py + " L" + d.px + "," + (d.py + r) + " L" + (d.px - r) + "," + d.py + " Z";
+    const fill = d.pos ? dark ? "rgba(220,80,60,0.88)" : "rgba(190,45,35,0.85)" : dark ? "rgba(60,100,230,0.88)" : "rgba(35,65,200,0.85)";
+    return /*#__PURE__*/React.createElement("g", {
+      key: i
+    }, /*#__PURE__*/React.createElement("path", {
+      d: path,
+      fill: fill,
+      stroke: "rgba(255,255,255,0.4)",
+      strokeWidth: "0.6"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: d.px,
+      y: d.py,
+      textAnchor: "middle",
+      dominantBaseline: "middle",
+      fontSize: r * 1.0,
+      fontWeight: "900",
+      fill: "rgba(255,255,255,0.95)",
+      fontFamily: "'DM Mono',monospace",
+      style: {
+        userSelect: "none"
+      }
+    }, d.pos ? "+" : "−"));
+  }), liqIons.map((ion, i) => /*#__PURE__*/React.createElement("g", {
+    key: i
+  }, /*#__PURE__*/React.createElement("circle", {
+    cx: ion.px,
+    cy: ion.py,
+    r: R_solv,
+    fill: "none",
+    stroke: solvStr(ion.pos),
+    strokeWidth: "0.9",
+    strokeDasharray: "3,2"
+  }), /*#__PURE__*/React.createElement("circle", {
+    cx: ion.px,
+    cy: ion.py,
+    r: R_bare,
+    fill: ionFill(ion.pos),
+    stroke: ionStr(ion.pos),
+    strokeWidth: "0.7"
+  }), /*#__PURE__*/React.createElement("text", {
+    x: ion.px,
+    y: ion.py,
+    textAnchor: "middle",
+    dominantBaseline: "middle",
+    fontSize: R_bare * 1.05,
+    fontWeight: "900",
+    fill: "rgba(255,255,255,0.95)",
+    fontFamily: "'DM Mono',monospace",
+    style: {
+      userSelect: "none"
+    }
+  }, ion.pos ? "+" : "−"))), scSurfSign !== 0 && (() => {
+    const bw = R_bare * 2 + 2;
+    const color = scSurfSign > 0 ? "#c03020" : "#2040c0";
+    return /*#__PURE__*/React.createElement("g", null, /*#__PURE__*/React.createElement("rect", {
+      x: ifX - bw / 2,
+      y: 0,
+      width: bw,
+      height: STRIP_H,
+      fill: color,
+      opacity: "0.35",
+      rx: "2"
+    }), [0.2, 0.5, 0.8].map((fy, i) => /*#__PURE__*/React.createElement("g", {
+      key: i
+    }, /*#__PURE__*/React.createElement("circle", {
+      cx: ifX,
+      cy: fy * STRIP_H,
+      r: R_bare - 1,
+      fill: color,
+      opacity: "0.85",
+      stroke: "rgba(255,255,255,0.4)",
+      strokeWidth: "0.6"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: ifX,
+      y: fy * STRIP_H,
+      textAnchor: "middle",
+      dominantBaseline: "middle",
+      fontSize: R_bare,
+      fontWeight: "900",
+      fill: "rgba(255,255,255,0.95)",
+      fontFamily: "'DM Mono',monospace"
+    }, scSurfSign > 0 ? "+" : "−"))));
+  })(), isMetal && metalSurfSign !== 0 && !curve.d_nm && (() => {
+    const bw = R_bare * 2 + 2;
+    const color = metalSurfSign > 0 ? "#c03020" : "#2040c0";
+    return /*#__PURE__*/React.createElement("g", null, /*#__PURE__*/React.createElement("rect", {
+      x: ifX - bw / 2,
+      y: 0,
+      width: bw,
+      height: STRIP_H,
+      fill: color,
+      opacity: "0.40",
+      rx: "2"
+    }), [0.2, 0.5, 0.8].map((fy, i) => /*#__PURE__*/React.createElement("g", {
+      key: i
+    }, /*#__PURE__*/React.createElement("circle", {
+      cx: ifX,
+      cy: fy * STRIP_H,
+      r: R_bare - 1,
+      fill: color,
+      opacity: "0.85",
+      stroke: "rgba(255,255,255,0.4)",
+      strokeWidth: "0.6"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: ifX,
+      y: fy * STRIP_H,
+      textAnchor: "middle",
+      dominantBaseline: "middle",
+      fontSize: R_bare,
+      fontWeight: "900",
+      fill: "rgba(255,255,255,0.95)",
+      fontFamily: "'DM Mono',monospace"
+    }, metalSurfSign > 0 ? "+" : "−"))));
+  })(), isMetal && curve.d_nm > 0 && (() => {
+    const sxOHP = padL + (-curve.d_nm - xMin_nm) / xSpan * plotW;
+    return /*#__PURE__*/React.createElement("g", null, /*#__PURE__*/React.createElement("line", {
+      x1: sxOHP,
+      x2: sxOHP,
+      y1: 0,
+      y2: STRIP_H,
+      stroke: "#b0609f",
+      strokeWidth: "1",
+      strokeDasharray: "3,2",
+      opacity: "0.7"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: (sxOHP + ifX) / 2,
+      y: STRIP_H - 6,
+      textAnchor: "middle",
+      fontSize: "7.5",
+      fill: "#b0609f",
+      fontFamily: "'DM Mono',monospace"
+    }, "Stern"));
+  })(), /*#__PURE__*/React.createElement("line", {
+    x1: ifX,
+    x2: ifX,
+    y1: 0,
+    y2: STRIP_H,
+    stroke: T.text,
+    strokeWidth: "1.5",
+    opacity: "0.7"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: padL,
+    y: 0,
+    width: plotW,
+    height: STRIP_H,
+    fill: "none",
+    stroke: T.border,
+    strokeWidth: "0.8",
+    rx: "2"
+  }), /*#__PURE__*/React.createElement("text", {
+    x: padL + 5,
+    y: STRIP_H - 6,
+    fontSize: "8",
+    fill: T.muted,
+    fontFamily: "'DM Mono',monospace",
+    opacity: "0.7"
+  }, "electrolyte"), /*#__PURE__*/React.createElement("text", {
+    x: ifX + 5,
+    y: STRIP_H - 6,
+    fontSize: "8",
+    fill: T.muted,
+    fontFamily: "'DM Mono',monospace",
+    opacity: "0.7"
+  }, isMetal ? "metal" : "electrode"), /*#__PURE__*/React.createElement("text", {
+    x: padL - 6,
+    y: STRIP_H / 2,
+    textAnchor: "middle",
+    dominantBaseline: "middle",
+    fontSize: "9",
+    fill: T.muted,
+    fontFamily: "'DM Mono',monospace",
+    transform: "rotate(-90," + (padL - 6) + "," + STRIP_H / 2 + ")"
+  }, "ρ(x)"), /*#__PURE__*/React.createElement("text", {
+    x: padL + plotW + 6,
+    y: STRIP_H * 0.3,
+    fontSize: "9",
+    fontWeight: "700",
+    fill: dark ? "rgba(255,130,120,0.9)" : "rgba(180,30,20,0.85)",
+    dominantBaseline: "middle"
+  }, "+"), /*#__PURE__*/React.createElement("text", {
+    x: padL + plotW + 6,
+    y: STRIP_H * 0.7,
+    fontSize: "9",
+    fontWeight: "700",
+    fill: dark ? "rgba(120,160,255,0.9)" : "rgba(20,50,200,0.85)",
+    dominantBaseline: "middle"
+  }, "−"));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SI FORMATTER
+// ═══════════════════════════════════════════════════════════════════
+function fmtSI(val, unit) {
+  const a = Math.abs(val);
+  if (a === 0) return {
+    v: "0",
+    u: unit
+  };
+  if (a >= 1e12) return {
+    v: (val / 1e12).toFixed(2),
+    u: "T" + unit
+  };
+  if (a >= 1e9) return {
+    v: (val / 1e9).toFixed(2),
+    u: "G" + unit
+  };
+  if (a >= 1e6) return {
+    v: (val / 1e6).toFixed(2),
+    u: "M" + unit
+  };
+  if (a >= 1e3) return {
+    v: (val / 1e3).toFixed(2),
+    u: "k" + unit
+  };
+  if (a >= 1) return {
+    v: val.toFixed(2),
+    u: unit
+  };
+  if (a >= 1e-3) return {
+    v: (val * 1e3).toFixed(2),
+    u: "m" + unit
+  };
+  return {
+    v: (val * 1e6).toFixed(2),
+    u: "\u03BC" + unit
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CHARGE DENSITY CHART  ρ(x)
+// ═══════════════════════════════════════════════════════════════════
+function ChargeDensityChart({
+  curves,
+  xMin_nm,
+  xMax_nm,
+  width,
+  height,
+  dark,
+  isMetal,
+  padL,
+  padR,
+  c0_M,
+  NA_cm3,
+  Temp
+}) {
+  const TH = dark ? DARK : LIGHT;
+  const pad = {
+    l: padL,
+    r: padR,
+    t: 12,
+    b: 10
+  };
+  const W = width - pad.l - pad.r;
+  const H = height - pad.t - pad.b;
+  if (!curves.length || W <= 0 || H <= 0) return null;
+  const curve = curves[0];
+  const xSpan = xMax_nm - xMin_nm;
+  const kT_eV = k_B * Temp / e_C;
+  const c0_m3 = c0_M * 1e3 * NA;
+  const NA_m3 = NA_cm3 * 1e6;
+  const phiSsgn = curve.phi_s_mV !== undefined ? Math.sign(curve.phi_s_mV) : -1;
+  const toX = x => pad.l + (x - xMin_nm) / xSpan * W;
+  const ifX = toX(0);
+  const rhoLiq = curve.liq.map(p => ({
+    x: p.x,
+    rho: -2 * e_C * c0_m3 * Math.sinh(Math.max(-200, Math.min(200, p.phi * 1e-3 / kT_eV)))
+  }));
+  const liqMax = Math.max(1e-20, ...rhoLiq.map(p => Math.abs(p.rho)));
+  const rho_SC = !isMetal && (curve.W_nm || 0) > 0 ? phiSsgn * e_C * NA_m3 : 0;
+  const solMax = Math.max(1e-20, Math.abs(rho_SC));
+  const y0 = pad.t + H / 2;
+  const toYliq = rho => y0 - rho / liqMax * (H / 2 * 0.86);
+  const toYsol = rho => y0 - rho / solMax * (H / 2 * 0.86);
+  const liqD = rhoLiq.length > 1 ? rhoLiq.map((p, i) => (i === 0 ? "M" : "L") + " " + toX(p.x).toFixed(1) + " " + toYliq(p.rho).toFixed(1)).join(" ") : "";
+  const liqF = liqD && rhoLiq.length > 1 ? liqD + " L " + toX(rhoLiq[rhoLiq.length - 1].x).toFixed(1) + " " + y0.toFixed(1) + " L " + toX(rhoLiq[0].x).toFixed(1) + " " + y0.toFixed(1) + " Z" : "";
+  const xW = toX(Math.min(curve.W_nm || 0, xMax_nm));
+  const yStep = toYsol(rho_SC);
+  const stepF = rho_SC !== 0 ? "M " + ifX.toFixed(1) + " " + y0.toFixed(1) + " L " + ifX.toFixed(1) + " " + yStep.toFixed(1) + " L " + xW.toFixed(1) + " " + yStep.toFixed(1) + " L " + xW.toFixed(1) + " " + y0.toFixed(1) + " Z" : "";
+  const liqMid = rhoLiq.length > 0 ? rhoLiq[Math.floor(rhoLiq.length / 2)].rho : 0;
+  const liqPos = liqMid > 0;
+  const solPos = rho_SC > 0;
+  const liqFC = liqPos ? "rgba(210,60,50,0.18)" : "rgba(40,80,210,0.18)";
+  const liqSC = liqPos ? "#c03020" : "#2040c0";
+  const solFC = solPos ? "rgba(210,60,50,0.18)" : "rgba(40,80,210,0.18)";
+  const solSC = solPos ? "#c03020" : "#2040c0";
+  const liqFmt = fmtSI(liqMax, "C/m\u00B3");
+  const solFmt = fmtSI(Math.abs(rho_SC), "C/m\u00B3");
+  return /*#__PURE__*/React.createElement("svg", {
+    width: width,
+    height: height,
+    style: {
+      display: "block",
+      overflow: "visible"
+    }
+  }, /*#__PURE__*/React.createElement("rect", {
+    x: pad.l,
+    y: pad.t,
+    width: Math.max(0, ifX - pad.l),
+    height: H,
+    fill: TH.liqBg,
+    opacity: "0.35"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: ifX,
+    y: pad.t,
+    width: Math.max(0, pad.l + W - ifX),
+    height: H,
+    fill: TH.solBg,
+    opacity: "0.35"
+  }), /*#__PURE__*/React.createElement("line", {
+    x1: pad.l,
+    x2: pad.l + W,
+    y1: y0,
+    y2: y0,
+    stroke: TH.grid,
+    strokeWidth: "0.8",
+    strokeDasharray: "3,3"
+  }), liqF && /*#__PURE__*/React.createElement("path", {
+    d: liqF,
+    fill: liqFC
+  }), stepF && /*#__PURE__*/React.createElement("path", {
+    d: stepF,
+    fill: solFC
+  }), rho_SC !== 0 && /*#__PURE__*/React.createElement("line", {
+    x1: ifX,
+    x2: xW,
+    y1: yStep.toFixed(1),
+    y2: yStep.toFixed(1),
+    stroke: solSC,
+    strokeWidth: "2"
+  }), rho_SC !== 0 && /*#__PURE__*/React.createElement("line", {
+    x1: xW,
+    x2: xW,
+    y1: y0,
+    y2: yStep,
+    stroke: solSC,
+    strokeWidth: "2"
+  }), liqD && /*#__PURE__*/React.createElement("path", {
+    d: liqD,
+    fill: "none",
+    stroke: liqSC,
+    strokeWidth: "1.8",
+    strokeLinecap: "round"
+  }), !isMetal && (curve.W_nm || 0) > 0 && /*#__PURE__*/React.createElement("line", {
+    x1: xW,
+    x2: xW,
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: TH.muted,
+    strokeWidth: "1",
+    strokeDasharray: "4,3",
+    opacity: "0.4"
+  }), curve.d_nm > 0 && /*#__PURE__*/React.createElement("line", {
+    x1: toX(-curve.d_nm),
+    x2: toX(-curve.d_nm),
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: "#b0609f",
+    strokeWidth: "1",
+    strokeDasharray: "3,2",
+    opacity: "0.6"
+  }), /*#__PURE__*/React.createElement("line", {
+    x1: ifX,
+    x2: ifX,
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: TH.text,
+    strokeWidth: "1.5",
+    opacity: "0.7"
+  }), /*#__PURE__*/React.createElement("line", {
+    x1: pad.l,
+    x2: pad.l,
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: TH.muted,
+    strokeWidth: "1"
+  }), /*#__PURE__*/React.createElement("line", {
+    x1: pad.l - 3,
+    x2: pad.l,
+    y1: pad.t + H * 0.07,
+    y2: pad.t + H * 0.07,
+    stroke: TH.muted,
+    strokeWidth: "1"
+  }), /*#__PURE__*/React.createElement("text", {
+    x: pad.l - 5,
+    y: pad.t + H * 0.07 + 3,
+    textAnchor: "end",
+    fontSize: "8",
+    fill: liqSC,
+    fontFamily: "'DM Mono',monospace"
+  }, liqFmt.v), /*#__PURE__*/React.createElement("line", {
+    x1: pad.l - 3,
+    x2: pad.l,
+    y1: pad.t + H * 0.93,
+    y2: pad.t + H * 0.93,
+    stroke: TH.muted,
+    strokeWidth: "1"
+  }), /*#__PURE__*/React.createElement("text", {
+    x: pad.l - 5,
+    y: pad.t + H * 0.93 + 3,
+    textAnchor: "end",
+    fontSize: "8",
+    fill: liqSC,
+    fontFamily: "'DM Mono',monospace"
+  }, "-" + liqFmt.v), /*#__PURE__*/React.createElement("text", {
+    x: pad.l - 5,
+    y: y0 + 3,
+    textAnchor: "end",
+    fontSize: "8",
+    fill: TH.muted
+  }, "0"), /*#__PURE__*/React.createElement("text", {
+    transform: "rotate(-90,9," + (pad.t + H / 4) + ")",
+    x: "9",
+    y: pad.t + H / 4,
+    textAnchor: "middle",
+    fontSize: "8",
+    fill: liqSC
+  }, liqFmt.u), rho_SC !== 0 && /*#__PURE__*/React.createElement("text", {
+    x: Math.min(xW - 3, pad.l + W - 2),
+    y: yStep - 4,
+    textAnchor: "end",
+    fontSize: "7.5",
+    fill: solSC,
+    fontFamily: "'DM Mono',monospace"
+  }, solFmt.v + " " + solFmt.u));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ELECTRIC FIELD CHART  |E(x)|
+// ═══════════════════════════════════════════════════════════════════
+function ElectricFieldChart({
+  curves,
+  xMin_nm,
+  xMax_nm,
+  width,
+  height,
+  dark,
+  padL,
+  padR
+}) {
+  const TH = dark ? DARK : LIGHT;
+  const pad = {
+    l: padL,
+    r: padR,
+    t: 10,
+    b: 28
+  };
+  const W = width - pad.l - pad.r;
+  const H = height - pad.t - pad.b;
+  if (!curves.length || W <= 0 || H <= 0) return null;
+  const curve = curves[0];
+  const xSpan = xMax_nm - xMin_nm;
+  const toX = x => pad.l + (x - xMin_nm) / xSpan * W;
+  const ifX = toX(0);
+  const y0 = pad.t + H;
+  const computeAbsE = pts => {
+    const s = pts.slice().sort((a, b) => a.x - b.x);
+    const out = [];
+    for (let i = 1; i < s.length - 1; i++) {
+      const dx = s[i + 1].x - s[i - 1].x;
+      if (Math.abs(dx) < 1e-10) continue;
+      out.push({
+        x: s[i].x,
+        E: Math.abs(-(s[i + 1].phi - s[i - 1].phi) / dx) * 1e6
+      });
+    }
+    return out;
+  };
+  const eLiq = computeAbsE(curve.liq);
+  const eSol = computeAbsE(curve.sol);
+  const eAll = [...eLiq, ...eSol];
+  if (!eAll.length) return null;
+  const eMax = Math.max(1e-10, ...eAll.map(p => p.E));
+  const toY = E => pad.t + H - E / eMax * H * 0.86;
+  const pathOf = pts => pts.length < 2 ? "" : pts.map((p, i) => (i === 0 ? "M" : "L") + " " + toX(p.x).toFixed(1) + " " + toY(p.E).toFixed(1)).join(" ");
+  const fillOf = (pts, path) => !path || pts.length < 2 ? "" : path + " L " + toX(pts[pts.length - 1].x).toFixed(1) + " " + y0.toFixed(1) + " L " + toX(pts[0].x).toFixed(1) + " " + y0.toFixed(1) + " Z";
+  const liqPath = pathOf(eLiq),
+    solPath = pathOf(eSol);
+  const liqFill = fillOf(eLiq, liqPath),
+    solFill = fillOf(eSol, solPath);
+  const {
+    v: emV,
+    u: emU
+  } = fmtSI(eMax, "V/m");
+  return /*#__PURE__*/React.createElement("svg", {
+    width: width,
+    height: height,
+    style: {
+      display: "block",
+      overflow: "visible"
+    }
+  }, /*#__PURE__*/React.createElement("rect", {
+    x: pad.l,
+    y: pad.t,
+    width: Math.max(0, ifX - pad.l),
+    height: H,
+    fill: TH.liqBg,
+    opacity: "0.35"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: ifX,
+    y: pad.t,
+    width: Math.max(0, pad.l + W - ifX),
+    height: H,
+    fill: TH.solBg,
+    opacity: "0.35"
+  }), liqFill && /*#__PURE__*/React.createElement("path", {
+    d: liqFill,
+    fill: "rgba(26,111,168,0.18)"
+  }), solFill && /*#__PURE__*/React.createElement("path", {
+    d: solFill,
+    fill: "rgba(107,75,30,0.18)"
+  }), liqPath && /*#__PURE__*/React.createElement("path", {
+    d: liqPath,
+    fill: "none",
+    stroke: "#1a6fa8",
+    strokeWidth: "1.8",
+    strokeLinecap: "round"
+  }), solPath && /*#__PURE__*/React.createElement("path", {
+    d: solPath,
+    fill: "none",
+    stroke: "#8b5e1a",
+    strokeWidth: "1.8",
+    strokeLinecap: "round"
+  }), curve.d_nm > 0 && /*#__PURE__*/React.createElement("line", {
+    x1: toX(-curve.d_nm),
+    x2: toX(-curve.d_nm),
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: "#b0609f",
+    strokeWidth: "1",
+    strokeDasharray: "3,2",
+    opacity: "0.6"
+  }), (curve.W_nm || 0) > 0 && /*#__PURE__*/React.createElement("line", {
+    x1: toX(curve.W_nm),
+    x2: toX(curve.W_nm),
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: TH.muted,
+    strokeWidth: "1",
+    strokeDasharray: "4,3",
+    opacity: "0.4"
+  }), /*#__PURE__*/React.createElement("line", {
+    x1: ifX,
+    x2: ifX,
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: TH.text,
+    strokeWidth: "1.5",
+    opacity: "0.7"
+  }), /*#__PURE__*/React.createElement("line", {
+    x1: pad.l,
+    x2: pad.l + W,
+    y1: y0,
+    y2: y0,
+    stroke: TH.muted,
+    strokeWidth: "1"
+  }), /*#__PURE__*/React.createElement("line", {
+    x1: pad.l,
+    x2: pad.l,
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: TH.muted,
+    strokeWidth: "1"
+  }), /*#__PURE__*/React.createElement("line", {
+    x1: pad.l - 3,
+    x2: pad.l,
+    y1: pad.t + H * 0.14,
+    y2: pad.t + H * 0.14,
+    stroke: TH.muted,
+    strokeWidth: "1"
+  }), /*#__PURE__*/React.createElement("text", {
+    x: pad.l - 5,
+    y: pad.t + H * 0.14 + 3,
+    textAnchor: "end",
+    fontSize: "8.5",
+    fill: TH.muted,
+    fontFamily: "'DM Mono',monospace"
+  }, emV), /*#__PURE__*/React.createElement("text", {
+    x: pad.l - 5,
+    y: y0 + 3,
+    textAnchor: "end",
+    fontSize: "8.5",
+    fill: TH.muted
+  }, "0"), /*#__PURE__*/React.createElement("text", {
+    transform: "rotate(-90,10," + (pad.t + H / 2) + ")",
+    x: "10",
+    y: pad.t + H / 2,
+    textAnchor: "middle",
+    fontSize: "8.5",
+    fill: TH.muted
+  }, emU), /*#__PURE__*/React.createElement("text", {
+    x: pad.l + W / 2,
+    y: height - 3,
+    textAnchor: "middle",
+    fontSize: "9",
+    fill: TH.muted
+  }, "x (nm)"));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SHARED: ELECTROLYTE SIDE  φ(x) chart
+// ═══════════════════════════════════════════════════════════════════
+function PotentialChart({
+  curves,
+  yMin,
+  yMax,
+  xMin_nm,
+  xMax_nm,
+  width,
+  height,
+  dark,
+  isMetal,
+  setTooltip
+}) {
+  const T = dark ? DARK : LIGHT;
+  const pad = {
+    l: 64,
+    r: 18,
+    t: 14,
+    b: 40
+  };
+  const W = width - pad.l - pad.r;
+  const H = height - pad.t - pad.b;
+  const xMin = xMin_nm ?? -6,
+    xMax = xMax_nm ?? 7;
+  const toSVG = (x, phi) => ({
+    sx: pad.l + (x - xMin) / (xMax - xMin) * W,
+    sy: pad.t + (yMax - phi) / (yMax - yMin) * H
+  });
+  // Smart x ticks: ~5–7 ticks over dynamic range
+  const xSpan = xMax - xMin;
+  const xTickStep = xSpan <= 2 ? 0.5 : xSpan <= 5 ? 1 : xSpan <= 12 ? 2 : 5;
+  const xTicks = [];
+  for (let v = Math.ceil(xMin / xTickStep) * xTickStep; v <= xMax + 1e-9; v += xTickStep) xTicks.push(parseFloat(v.toFixed(4)));
+  const yRange = yMax - yMin;
+  const yStep = yRange <= 300 ? 50 : yRange <= 700 ? 100 : 200;
+  const yTicks = [];
+  for (let v = Math.ceil(yMin / yStep) * yStep; v <= yMax; v += yStep) yTicks.push(v);
+  const makePath = pts => pts.map((p, i) => {
+    const {
+      sx,
+      sy
+    } = toSVG(p.x, p.phi);
+    return `${i === 0 ? "M" : "L"} ${sx.toFixed(1)} ${sy.toFixed(1)}`;
+  }).join(" ");
+  const ifX = toSVG(0, 0).sx;
+  const svgRef = useRef(null);
+  const handleMouseMove = useCallback(e => {
+    if (!svgRef.current || !curves.length) return;
+    const rect = svgRef.current.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const x_nm = xMin + (mx - pad.l) / W * (xMax - xMin);
+    if (x_nm < xMin || x_nm > xMax) {
+      setTooltip(null);
+      return;
+    }
+    const rows = [];
+    curves.forEach(c => {
+      const pts = [...c.liq, ...c.sol];
+      let best = null,
+        bd = Infinity;
+      pts.forEach(p => {
+        const d = Math.abs(p.x - x_nm);
+        if (d < bd) {
+          bd = d;
+          best = p;
+        }
+      });
+      if (best) rows.push({
+        color: c.color,
+        label: c.label || "φ(x)",
+        phi: best.phi.toFixed(1)
+      });
+    });
+    setTooltip({
+      x: mx + svgRef.current.getBoundingClientRect().left,
+      y: e.clientY,
+      x_nm: x_nm.toFixed(2),
+      rows
+    });
+  }, [curves, xMin, xMax, W, pad.l, setTooltip]);
+
+  // Metal hatching pattern
+  const hatchId = "metal-hatch";
+  const solColor = isMetal ? dark ? T.metalBg : T.metalBg : T.solBg;
+  return /*#__PURE__*/React.createElement("svg", {
+    ref: svgRef,
+    width: width,
+    height: height,
+    style: {
+      display: "block",
+      overflow: "visible",
+      cursor: "crosshair"
+    },
+    onMouseMove: handleMouseMove,
+    onMouseLeave: () => setTooltip(null)
+  }, /*#__PURE__*/React.createElement("defs", null, /*#__PURE__*/React.createElement("pattern", {
+    id: hatchId,
+    width: "6",
+    height: "6",
+    patternUnits: "userSpaceOnUse",
+    patternTransform: "rotate(45)"
+  }, /*#__PURE__*/React.createElement("line", {
+    x1: "0",
+    y1: "0",
+    x2: "0",
+    y2: "6",
+    stroke: dark ? "#333348" : "#b0b0c0",
+    strokeWidth: "2"
+  }))), /*#__PURE__*/React.createElement("rect", {
+    x: pad.l,
+    y: pad.t,
+    width: ifX - pad.l,
+    height: H,
+    fill: T.liqBg,
+    opacity: "0.55"
+  }), isMetal ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("rect", {
+    x: ifX,
+    y: pad.t,
+    width: pad.l + W - ifX,
+    height: H,
+    fill: dark ? "#1e1e2e" : "#d0d0e0",
+    opacity: "0.4"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: ifX,
+    y: pad.t,
+    width: pad.l + W - ifX,
+    height: H,
+    fill: `url(#${hatchId})`,
+    opacity: "0.5"
+  })) : /*#__PURE__*/React.createElement("rect", {
+    x: ifX,
+    y: pad.t,
+    width: pad.l + W - ifX,
+    height: H,
+    fill: T.solBg,
+    opacity: "0.55"
+  }), yTicks.map(v => {
+    const y = toSVG(0, v).sy;
+    return /*#__PURE__*/React.createElement("line", {
+      key: v,
+      x1: pad.l,
+      x2: pad.l + W,
+      y1: y,
+      y2: y,
+      stroke: T.grid,
+      strokeWidth: "0.7",
+      strokeDasharray: "3,3"
+    });
+  }), xTicks.map(x => {
+    const sx = toSVG(x, 0).sx;
+    return /*#__PURE__*/React.createElement("line", {
+      key: x,
+      x1: sx,
+      x2: sx,
+      y1: pad.t,
+      y2: pad.t + H,
+      stroke: T.grid,
+      strokeWidth: "0.7",
+      strokeDasharray: "3,3"
+    });
+  }), (() => {
+    const sy0 = toSVG(0, 0).sy;
+    return /*#__PURE__*/React.createElement("g", null, /*#__PURE__*/React.createElement("line", {
+      x1: pad.l,
+      x2: ifX,
+      y1: sy0,
+      y2: sy0,
+      stroke: "#1a8fc0",
+      strokeWidth: "1.5",
+      strokeDasharray: "8,4",
+      opacity: "0.9"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: pad.l + 4,
+      y: sy0 - 5,
+      fontSize: "9",
+      fill: "#1a8fc0",
+      opacity: "0.95",
+      fontFamily: "'DM Mono',monospace"
+    }, /*#__PURE__*/React.createElement("tspan", null, "E"), /*#__PURE__*/React.createElement("tspan", {
+      baselineShift: "sub",
+      fontSize: "7"
+    }, "vac"), /*#__PURE__*/React.createElement("tspan", null, "(liq bulk) = −4.44 eV vs vac")));
+  })(), curves.map((c, i) => {
+    const y = toSVG(0, c.phiTotal * 1000).sy;
+    return /*#__PURE__*/React.createElement("line", {
+      key: `pt-${i}`,
+      x1: pad.l,
+      x2: pad.l + W,
+      y1: y,
+      y2: y,
+      stroke: c.color,
+      strokeWidth: "0.6",
+      strokeDasharray: "6,3",
+      opacity: "0.4"
+    });
+  }), curves.map((c, i) => {
+    if (!c.d_nm) return null;
+    const sxOHP = toSVG(-c.d_nm, 0).sx;
+    const sxIHP = toSVG(0, 0).sx;
+    if (sxOHP < pad.l || sxOHP > sxIHP) return null;
+    return /*#__PURE__*/React.createElement("g", {
+      key: "stern-" + i
+    }, /*#__PURE__*/React.createElement("rect", {
+      x: sxOHP,
+      y: pad.t,
+      width: Math.max(1, sxIHP - sxOHP),
+      height: H,
+      fill: dark ? "rgba(176,96,159,0.15)" : "rgba(176,96,159,0.10)"
+    }), /*#__PURE__*/React.createElement("line", {
+      x1: sxOHP,
+      x2: sxOHP,
+      y1: pad.t,
+      y2: pad.t + H,
+      stroke: "#b0609f",
+      strokeWidth: "1.2",
+      strokeDasharray: "4,3",
+      opacity: "0.7"
+    }), i === 0 && /*#__PURE__*/React.createElement("text", {
+      x: sxOHP - 3,
+      y: pad.t + 10,
+      fontSize: "8.5",
+      fill: "#b0609f",
+      textAnchor: "end",
+      fontFamily: "'DM Mono',monospace"
+    }, "OHP"));
+  }), !isMetal && curves.map((c, i) => {
+    const sx = toSVG(c.W_nm, 0).sx;
+    return /*#__PURE__*/React.createElement("line", {
+      key: `w-${i}`,
+      x1: sx,
+      x2: sx,
+      y1: pad.t,
+      y2: pad.t + H,
+      stroke: c.color,
+      strokeWidth: "1.1",
+      strokeDasharray: "5,3",
+      opacity: "0.65"
+    });
+  }), curves.map((c, i) => {
+    if (!c.lambda_D_nm) return null;
+    const sx = toSVG(-c.lambda_D_nm, 0).sx;
+    if (sx < pad.l || sx > pad.l + W) return null;
+    return /*#__PURE__*/React.createElement("g", {
+      key: `ld-${i}`
+    }, /*#__PURE__*/React.createElement("line", {
+      x1: sx,
+      x2: sx,
+      y1: pad.t,
+      y2: pad.t + H,
+      stroke: "#1a8fc0",
+      strokeWidth: "1.1",
+      strokeDasharray: "4,3",
+      opacity: "0.7"
+    }), i === 0 && /*#__PURE__*/React.createElement("text", {
+      x: sx - 3,
+      y: pad.t + 10,
+      textAnchor: "end",
+      fontSize: "8.5",
+      fill: "#1a8fc0",
+      fontFamily: "'DM Mono',monospace",
+      opacity: "0.9"
+    }, /*#__PURE__*/React.createElement("tspan", null, "λ"), /*#__PURE__*/React.createElement("tspan", {
+      baselineShift: "sub",
+      fontSize: "7"
+    }, "D")));
+  }), /*#__PURE__*/React.createElement("line", {
+    x1: ifX,
+    x2: ifX,
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: T.text,
+    strokeWidth: "2"
+  }), curves.map((c, i) => /*#__PURE__*/React.createElement("g", {
+    key: i
+  }, /*#__PURE__*/React.createElement("path", {
+    d: makePath(c.liq),
+    fill: "none",
+    stroke: c.color,
+    strokeWidth: "2.3",
+    strokeLinecap: "round",
+    strokeLinejoin: "round"
+  }), /*#__PURE__*/React.createElement("path", {
+    d: makePath(c.sol),
+    fill: "none",
+    stroke: c.color,
+    strokeWidth: isMetal ? 2.8 : 2.3,
+    strokeLinecap: "round",
+    strokeLinejoin: "round",
+    strokeDasharray: isMetal ? "none" : "none"
+  }))), /*#__PURE__*/React.createElement("line", {
+    x1: pad.l,
+    x2: pad.l + W,
+    y1: pad.t + H,
+    y2: pad.t + H,
+    stroke: T.muted,
+    strokeWidth: "1.2"
+  }), /*#__PURE__*/React.createElement("line", {
+    x1: pad.l,
+    x2: pad.l,
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: T.muted,
+    strokeWidth: "1.2"
+  }), xTicks.map(x => {
+    const sx = toSVG(x, 0).sx;
+    return /*#__PURE__*/React.createElement("g", {
+      key: x
+    }, /*#__PURE__*/React.createElement("line", {
+      x1: sx,
+      x2: sx,
+      y1: pad.t + H,
+      y2: pad.t + H + 5,
+      stroke: T.muted,
+      strokeWidth: "1"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: sx,
+      y: pad.t + H + 17,
+      textAnchor: "middle",
+      fontSize: "10",
+      fill: T.textSub
+    }, Number.isInteger(x) ? x : x.toFixed(1)));
+  }), yTicks.map(v => {
+    const sy = toSVG(0, v).sy;
+    return /*#__PURE__*/React.createElement("g", {
+      key: v
+    }, /*#__PURE__*/React.createElement("line", {
+      x1: pad.l - 4,
+      x2: pad.l,
+      y1: sy,
+      y2: sy,
+      stroke: T.muted,
+      strokeWidth: "1"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: pad.l - 7,
+      y: sy + 4,
+      textAnchor: "end",
+      fontSize: "10",
+      fill: T.textSub
+    }, v));
+  }), /*#__PURE__*/React.createElement("text", {
+    x: pad.l + W / 2,
+    y: height - 2,
+    textAnchor: "middle",
+    fontSize: "11",
+    fill: T.textSub
+  }, "Position x (nm)"), /*#__PURE__*/React.createElement("text", {
+    transform: `rotate(-90,13,${pad.t + H / 2})`,
+    x: 13,
+    y: pad.t + H / 2,
+    textAnchor: "middle",
+    fontSize: "11",
+    fill: T.textSub
+  }, "φ(x) (mV)"), /*#__PURE__*/React.createElement("text", {
+    x: (pad.l + ifX) / 2,
+    y: pad.t + 18,
+    textAnchor: "middle",
+    fontSize: "10.5",
+    fill: "#1c5a8a",
+    fontWeight: "600"
+  }, "Electrolyte"), /*#__PURE__*/React.createElement("text", {
+    x: (ifX + pad.l + W) / 2,
+    y: pad.t + 18,
+    textAnchor: "middle",
+    fontSize: "10.5",
+    fill: isMetal ? dark ? "#aaaacc" : "#4a4a6a" : dark ? "#b8a060" : "#6b4c1e",
+    fontWeight: "600"
+  }, isMetal ? "Metal" : "Electrode"));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SEMICONDUCTOR BAND DIAGRAM
+// ═══════════════════════════════════════════════════════════════════
+function BandDiagramChart_SC({
+  curves,
+  chi_eV,
+  Eg_eV,
+  WF_eV,
+  xMin_nm,
+  xMax_nm,
+  width,
+  height,
+  dark,
+  setTooltip
+}) {
+  const T = dark ? DARK : LIGHT;
+  const pad = {
+    l: 62,
+    r: 64,
+    t: 24,
+    b: 42
+  };
+  const W = width - pad.l - pad.r;
+  const H = height - pad.t - pad.b;
+  const xMin = xMin_nm ?? -6,
+    xMax = xMax_nm ?? 7;
+  const bandData = curves.map(c => getBandProfile_SC(c, chi_eV, Eg_eV, WF_eV)).filter(Boolean);
+  if (!bandData.length) return null;
+  const allE = bandData.flatMap(b => [...b.solPts.flatMap(p => [p.vac, p.cbm, p.vbm]), ...b.liqPts.map(p => p.vac), b.ef]);
+  const rawEmin = Math.min(...allE),
+    rawEmax = Math.max(...allE);
+  const eRange = rawEmax - rawEmin;
+  const eMin = rawEmin - eRange * 0.12,
+    eMax = rawEmax + eRange * 0.12;
+  const toSVG = (x, e) => ({
+    sx: pad.l + (x - xMin) / (xMax - xMin) * W,
+    sy: pad.t + (eMax - e) / (eMax - eMin) * H
+  });
+  const syFromE = e => pad.t + (eMax - e) / (eMax - eMin) * H;
+  const ifX = toSVG(0, 0).sx;
+  const rightX = pad.l + W;
+  const eStep = eRange > 8 ? 2 : eRange > 4 ? 1 : 0.5;
+  const eTicks = [];
+  for (let v = Math.ceil(eMin / eStep) * eStep; v <= eMax + 1e-9; v += eStep) eTicks.push(parseFloat(v.toFixed(6)));
+  const toSHE = bandData[0].toSHE;
+  const sheMax = toSHE(eMin),
+    sheMin = toSHE(eMax),
+    sheSpan = sheMax - sheMin;
+  const sheStep = sheSpan > 8 ? 2 : sheSpan > 4 ? 1 : sheSpan > 2 ? 0.5 : 0.2;
+  const sheTicks = [];
+  for (let v = Math.ceil(sheMin / sheStep) * sheStep; v <= sheMax + 1e-9; v += sheStep) sheTicks.push(parseFloat(v.toFixed(6)));
+  const makePath = (pts, key) => pts.map((p, i) => {
+    const {
+      sx,
+      sy
+    } = toSVG(p.x, p[key]);
+    return `${i === 0 ? "M" : "L"} ${sx.toFixed(1)} ${sy.toFixed(1)}`;
+  }).join(" ");
+  const multiCurve = curves.length > 1;
+  const vacRefE = curves[0]?.phiTotal ?? 0;
+  const vacRefY = syFromE(vacRefE);
+  const vacRefOk = vacRefY >= pad.t - 2 && vacRefY <= pad.t + H + 2;
+  const svgRef = useRef(null);
+  const handleMouseMove = useCallback(e => {
+    if (!svgRef.current || !bandData.length) return;
+    const rect = svgRef.current.getBoundingClientRect();
+    const mx = e.clientX - rect.left,
+      my = e.clientY - rect.top;
+    const x_nm = xMin + (mx - pad.l) / W * (xMax - xMin);
+    if (x_nm < xMin || x_nm > xMax) {
+      setTooltip(null);
+      return;
+    }
+    const rows = [];
+    bandData.forEach((b, bi) => {
+      const sol = b.solPts.find(p => Math.abs(p.x - x_nm) < 0.1);
+      rows.push({
+        color: curves[bi].color,
+        label: curves[bi].label || "single",
+        cbm: sol ? sol.cbm.toFixed(3) : "—",
+        vbm: sol ? sol.vbm.toFixed(3) : "—",
+        ef: b.ef.toFixed(3)
+      });
+    });
+    setTooltip({
+      x: e.clientX,
+      y: e.clientY,
+      x_nm: x_nm.toFixed(2),
+      rows,
+      band: true
+    });
+  }, [bandData, curves, xMin, xMax, W, pad.l, setTooltip]);
+  return /*#__PURE__*/React.createElement("svg", {
+    ref: svgRef,
+    width: width,
+    height: height,
+    style: {
+      display: "block",
+      overflow: "visible",
+      cursor: "crosshair"
+    },
+    onMouseMove: handleMouseMove,
+    onMouseLeave: () => setTooltip(null)
+  }, /*#__PURE__*/React.createElement("rect", {
+    x: pad.l,
+    y: pad.t,
+    width: ifX - pad.l,
+    height: H,
+    fill: T.liqBg,
+    opacity: "0.45"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: ifX,
+    y: pad.t,
+    width: rightX - ifX,
+    height: H,
+    fill: T.solBg,
+    opacity: "0.45"
+  }), eTicks.map(v => {
+    const sy = syFromE(v);
+    return /*#__PURE__*/React.createElement("line", {
+      key: v,
+      x1: pad.l,
+      x2: rightX,
+      y1: sy,
+      y2: sy,
+      stroke: T.grid,
+      strokeWidth: "0.7",
+      strokeDasharray: "3,3"
+    });
+  }), /*#__PURE__*/React.createElement("line", {
+    x1: ifX,
+    x2: ifX,
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: T.text,
+    strokeWidth: "2"
+  }), vacRefOk && /*#__PURE__*/React.createElement("g", null, /*#__PURE__*/React.createElement("line", {
+    x1: pad.l,
+    x2: ifX,
+    y1: vacRefY,
+    y2: vacRefY,
+    stroke: "#1a8fc0",
+    strokeWidth: "1.8",
+    strokeDasharray: "8,4",
+    opacity: "0.9"
+  }), /*#__PURE__*/React.createElement("text", {
+    x: pad.l + 8,
+    y: vacRefY - 5,
+    fontSize: "9",
+    fill: "#1a8fc0",
+    fontFamily: "'DM Mono',monospace",
+    opacity: "0.95"
+  }, /*#__PURE__*/React.createElement("tspan", null, "E"), /*#__PURE__*/React.createElement("tspan", {
+    baselineShift: "sub",
+    fontSize: "7"
+  }, "vac"), /*#__PURE__*/React.createElement("tspan", null, "(liq bulk) = −4.44 eV vs vac")), /*#__PURE__*/React.createElement("circle", {
+    cx: pad.l + 3,
+    cy: vacRefY,
+    r: "3",
+    fill: "#1a8fc0",
+    opacity: "0.75"
+  })), bandData.map((b, bi) => {
+    const color = multiCurve ? curves[bi].color : null;
+    const vacC = color ?? "#7f3fbf",
+      cbmC = color ?? "#c0392b",
+      vbmC = color ?? "#2471a3",
+      efC = color ?? "#1e8449";
+    const sw = multiCurve ? 1.6 : 2.2;
+    return /*#__PURE__*/React.createElement("g", {
+      key: bi,
+      opacity: multiCurve ? 0.85 : 1
+    }, /*#__PURE__*/React.createElement("path", {
+      d: makePath(b.solPts, "vac"),
+      fill: "none",
+      stroke: vacC,
+      strokeWidth: sw * 0.8,
+      strokeDasharray: "6,3"
+    }), /*#__PURE__*/React.createElement("path", {
+      d: makePath(b.liqPts, "vac"),
+      fill: "none",
+      stroke: vacC,
+      strokeWidth: sw * 0.8,
+      strokeDasharray: "6,3"
+    }), /*#__PURE__*/React.createElement("path", {
+      d: makePath(b.solPts, "cbm"),
+      fill: "none",
+      stroke: cbmC,
+      strokeWidth: sw
+    }), /*#__PURE__*/React.createElement("path", {
+      d: makePath(b.solPts, "vbm"),
+      fill: "none",
+      stroke: vbmC,
+      strokeWidth: sw
+    }), !multiCurve && (() => {
+      const cbmP = b.solPts.map(p => toSVG(p.x, p.cbm));
+      const vbmP = b.solPts.map(p => toSVG(p.x, p.vbm));
+      const fwd = cbmP.map((p, i) => `${i === 0 ? "M" : "L"} ${p.sx.toFixed(1)} ${p.sy.toFixed(1)}`).join(" ");
+      const bwd = [...vbmP].reverse().map(p => `L ${p.sx.toFixed(1)} ${p.sy.toFixed(1)}`).join(" ");
+      return /*#__PURE__*/React.createElement("path", {
+        d: `${fwd} ${bwd} Z`,
+        fill: "#dce8f5",
+        opacity: "0.3"
+      });
+    })(), (() => {
+      const sy = syFromE(b.ef);
+      return /*#__PURE__*/React.createElement("line", {
+        x1: pad.l,
+        x2: rightX,
+        y1: sy,
+        y2: sy,
+        stroke: efC,
+        strokeWidth: sw,
+        strokeDasharray: "9,4"
+      });
+    })(), (() => {
+      const {
+        sx
+      } = toSVG(curves[bi].W_nm, 0);
+      return /*#__PURE__*/React.createElement("line", {
+        x1: sx,
+        x2: sx,
+        y1: pad.t,
+        y2: pad.t + H,
+        stroke: color ?? "#888",
+        strokeWidth: "1.1",
+        strokeDasharray: "5,3",
+        opacity: "0.55"
+      });
+    })());
+  }), curves.map((c, i) => {
+    if (!c.lambda_D_nm) return null;
+    const {
+      sx
+    } = toSVG(-c.lambda_D_nm, 0);
+    if (sx < pad.l || sx > ifX) return null;
+    return /*#__PURE__*/React.createElement("g", {
+      key: `ld-${i}`
+    }, /*#__PURE__*/React.createElement("line", {
+      x1: sx,
+      x2: sx,
+      y1: pad.t,
+      y2: pad.t + H,
+      stroke: "#1a8fc0",
+      strokeWidth: "1.1",
+      strokeDasharray: "4,3",
+      opacity: "0.7"
+    }), i === 0 && /*#__PURE__*/React.createElement("text", {
+      x: sx - 3,
+      y: pad.t + 10,
+      textAnchor: "end",
+      fontSize: "8.5",
+      fill: "#1a8fc0",
+      fontFamily: "'DM Mono',monospace",
+      opacity: "0.9"
+    }, /*#__PURE__*/React.createElement("tspan", null, "λ"), /*#__PURE__*/React.createElement("tspan", {
+      baselineShift: "sub",
+      fontSize: "7"
+    }, "D")));
+  }), !multiCurve && bandData.length > 0 && (() => {
+    const b = bandData[0],
+      lSol = b.solPts[b.solPts.length - 1],
+      efY = syFromE(b.ef);
+    return /*#__PURE__*/React.createElement("g", {
+      fontSize: "10.5",
+      fontFamily: "'DM Mono',monospace"
+    }, /*#__PURE__*/React.createElement("text", {
+      x: rightX - 4,
+      y: syFromE(lSol.vac) - 5,
+      textAnchor: "end",
+      fill: "#7f3fbf",
+      fontStyle: "italic"
+    }, /*#__PURE__*/React.createElement("tspan", null, "E"), /*#__PURE__*/React.createElement("tspan", {
+      baselineShift: "sub",
+      fontSize: "8"
+    }, "vac")), /*#__PURE__*/React.createElement("text", {
+      x: rightX - 4,
+      y: syFromE(lSol.cbm) - 5,
+      textAnchor: "end",
+      fill: "#c0392b",
+      fontWeight: "600"
+    }, "CBM"), /*#__PURE__*/React.createElement("text", {
+      x: rightX - 4,
+      y: syFromE(lSol.vbm) + 14,
+      textAnchor: "end",
+      fill: "#2471a3",
+      fontWeight: "600"
+    }, "VBM"), /*#__PURE__*/React.createElement("text", {
+      x: pad.l + W * 0.78,
+      y: efY - 5,
+      textAnchor: "middle",
+      fill: "#1e8449",
+      fontWeight: "700"
+    }, /*#__PURE__*/React.createElement("tspan", null, "E"), /*#__PURE__*/React.createElement("tspan", {
+      baselineShift: "sub",
+      fontSize: "8"
+    }, "F")), /*#__PURE__*/React.createElement("text", {
+      x: pad.l + W * 0.2,
+      y: efY - 5,
+      textAnchor: "middle",
+      fill: "#1e8449",
+      fontWeight: "700"
+    }, /*#__PURE__*/React.createElement("tspan", null, "E"), /*#__PURE__*/React.createElement("tspan", {
+      baselineShift: "sub",
+      fontSize: "8"
+    }, "F"), /*#__PURE__*/React.createElement("tspan", null, " = μ"), /*#__PURE__*/React.createElement("tspan", {
+      baselineShift: "sub",
+      fontSize: "8"
+    }, "elec")));
+  })(), /*#__PURE__*/React.createElement("line", {
+    x1: rightX,
+    x2: rightX,
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: T.muted,
+    strokeWidth: "1.2"
+  }), eTicks.map(v => {
+    const sy = syFromE(v);
+    return /*#__PURE__*/React.createElement("g", {
+      key: v
+    }, /*#__PURE__*/React.createElement("line", {
+      x1: rightX,
+      x2: rightX + 4,
+      y1: sy,
+      y2: sy,
+      stroke: T.muted,
+      strokeWidth: "1"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: rightX + 7,
+      y: sy + 4,
+      textAnchor: "start",
+      fontSize: "10",
+      fill: T.textSub
+    }, v.toFixed(1)));
+  }), /*#__PURE__*/React.createElement("text", {
+    transform: `rotate(90,${width - 11},${pad.t + H / 2})`,
+    x: width - 11,
+    y: pad.t + H / 2,
+    textAnchor: "middle",
+    fontSize: "11",
+    fill: T.textSub
+  }, "Energy (eV vs vac)"), /*#__PURE__*/React.createElement("line", {
+    x1: pad.l,
+    x2: pad.l,
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: "#1c5a8a",
+    strokeWidth: "1.2"
+  }), sheTicks.map(v => {
+    const E_for_tick = curves[0].phiTotal - v - 4.44;
+    const sy = syFromE(E_for_tick);
+    if (sy < pad.t - 2 || sy > pad.t + H + 2) return null;
+    return /*#__PURE__*/React.createElement("g", {
+      key: v
+    }, /*#__PURE__*/React.createElement("line", {
+      x1: pad.l - 4,
+      x2: pad.l,
+      y1: sy,
+      y2: sy,
+      stroke: "#1c5a8a",
+      strokeWidth: "1"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: pad.l - 7,
+      y: sy + 4,
+      textAnchor: "end",
+      fontSize: "10",
+      fill: "#1c5a8a"
+    }, v % 1 === 0 ? v.toFixed(0) : v.toFixed(1)));
+  }), (() => {
+    const sy0 = syFromE(curves[0].phiTotal - 4.44);
+    if (sy0 < pad.t || sy0 > pad.t + H) return null;
+    return /*#__PURE__*/React.createElement("line", {
+      x1: pad.l,
+      x2: ifX,
+      y1: sy0,
+      y2: sy0,
+      stroke: "#1c5a8a",
+      strokeWidth: "0.8",
+      strokeDasharray: "4,3",
+      opacity: "0.5"
+    });
+  })(), /*#__PURE__*/React.createElement("text", {
+    transform: `rotate(-90,11,${pad.t + H / 2})`,
+    x: 11,
+    y: pad.t + H / 2,
+    textAnchor: "middle",
+    fontSize: "11",
+    fill: "#1c5a8a"
+  }, "E (V vs SHE) ↓"), (() => {
+    const xSpan = xMax - xMin;
+    const step = xSpan <= 2 ? 0.5 : xSpan <= 5 ? 1 : xSpan <= 12 ? 2 : 5;
+    const ticks = [];
+    for (let v = Math.ceil(xMin / step) * step; v <= xMax + 1e-9; v += step) ticks.push(parseFloat(v.toFixed(4)));
+    return /*#__PURE__*/React.createElement("g", null, /*#__PURE__*/React.createElement("line", {
+      x1: pad.l,
+      x2: rightX,
+      y1: pad.t + H,
+      y2: pad.t + H,
+      stroke: T.muted,
+      strokeWidth: "1.2"
+    }), ticks.map(x => {
+      const {
+        sx
+      } = toSVG(x, 0);
+      return /*#__PURE__*/React.createElement("g", {
+        key: x
+      }, /*#__PURE__*/React.createElement("line", {
+        x1: sx,
+        x2: sx,
+        y1: pad.t + H,
+        y2: pad.t + H + 5,
+        stroke: T.muted,
+        strokeWidth: "1"
+      }), /*#__PURE__*/React.createElement("text", {
+        x: sx,
+        y: pad.t + H + 17,
+        textAnchor: "middle",
+        fontSize: "10",
+        fill: T.textSub
+      }, Number.isInteger(x) ? x : x.toFixed(1)));
+    }));
+  })(), /*#__PURE__*/React.createElement("text", {
+    x: pad.l + W / 2,
+    y: height - 4,
+    textAnchor: "middle",
+    fontSize: "11",
+    fill: T.textSub
+  }, "Position x (nm)"), /*#__PURE__*/React.createElement("text", {
+    x: (pad.l + ifX) / 2,
+    y: pad.t + 12,
+    textAnchor: "middle",
+    fontSize: "10.5",
+    fill: "#1c5a8a",
+    fontWeight: "600"
+  }, "Electrolyte"), /*#__PURE__*/React.createElement("text", {
+    x: (ifX + rightX) / 2,
+    y: pad.t + 12,
+    textAnchor: "middle",
+    fontSize: "10.5",
+    fill: dark ? "#b8a060" : "#6b4c1e",
+    fontWeight: "600"
+  }, "Electrode"));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  METAL BAND DIAGRAM
+//  Shows: flat E_F, flat E_vac above it (= WF), hatched metal region,
+//  plus the diffuse-layer E_vac on the electrolyte side.
+// ═══════════════════════════════════════════════════════════════════
+function BandDiagramChart_Metal({
+  curves,
+  WF_eV,
+  xMin_nm,
+  xMax_nm,
+  width,
+  height,
+  dark,
+  setTooltip
+}) {
+  const T = dark ? DARK : LIGHT;
+  const pad = {
+    l: 62,
+    r: 64,
+    t: 24,
+    b: 42
+  };
+  const W = width - pad.l - pad.r;
+  const H = height - pad.t - pad.b;
+  const xMin = xMin_nm ?? -6,
+    xMax = xMax_nm ?? 7;
+  const bandData = curves.map(c => getBandProfile_Metal(c, WF_eV)).filter(Boolean);
+  if (!bandData.length) return null;
+  const allE = bandData.flatMap(b => [...b.solPts.map(p => p.vac), ...b.liqPts.map(p => p.vac), b.ef, b.ef + WF_eV + 0.3 // ensure E_vac(metal) in range
+  ]);
+  const rawEmin = Math.min(...allE),
+    rawEmax = Math.max(...allE);
+  const eRange = rawEmax - rawEmin;
+  const eMin = rawEmin - eRange * 0.15,
+    eMax = rawEmax + eRange * 0.15;
+  const toSVG = (x, e) => ({
+    sx: pad.l + (x - xMin) / (xMax - xMin) * W,
+    sy: pad.t + (eMax - e) / (eMax - eMin) * H
+  });
+  const syFromE = e => pad.t + (eMax - e) / (eMax - eMin) * H;
+  const ifX = toSVG(0, 0).sx;
+  const rightX = pad.l + W;
+  const eStep = eRange > 8 ? 2 : eRange > 4 ? 1 : 0.5;
+  const eTicks = [];
+  for (let v = Math.ceil(eMin / eStep) * eStep; v <= eMax + 1e-9; v += eStep) eTicks.push(parseFloat(v.toFixed(6)));
+  const toSHE = bandData[0].toSHE;
+  const sheMax = toSHE(eMin),
+    sheMin = toSHE(eMax),
+    sheSpan = sheMax - sheMin;
+  const sheStep = sheSpan > 8 ? 2 : sheSpan > 4 ? 1 : sheSpan > 2 ? 0.5 : 0.2;
+  const sheTicks = [];
+  for (let v = Math.ceil(sheMin / sheStep) * sheStep; v <= sheMax + 1e-9; v += sheStep) sheTicks.push(parseFloat(v.toFixed(6)));
+  const makePath = (pts, key) => pts.map((p, i) => {
+    const {
+      sx,
+      sy
+    } = toSVG(p.x, p[key]);
+    return `${i === 0 ? "M" : "L"} ${sx.toFixed(1)} ${sy.toFixed(1)}`;
+  }).join(" ");
+  const multiCurve = curves.length > 1;
+
+  // Reference line
+  const vacRefE = curves[0]?.phiTotal ?? 0;
+  const vacRefY = syFromE(vacRefE);
+  const vacRefOk = vacRefY >= pad.t - 2 && vacRefY <= pad.t + H + 2;
+  const hatchId = "metal-band-hatch";
+  return /*#__PURE__*/React.createElement("svg", {
+    width: width,
+    height: height,
+    style: {
+      display: "block",
+      overflow: "visible"
+    }
+  }, /*#__PURE__*/React.createElement("defs", null, /*#__PURE__*/React.createElement("pattern", {
+    id: hatchId,
+    width: "8",
+    height: "8",
+    patternUnits: "userSpaceOnUse",
+    patternTransform: "rotate(45)"
+  }, /*#__PURE__*/React.createElement("line", {
+    x1: "0",
+    y1: "0",
+    x2: "0",
+    y2: "8",
+    stroke: dark ? "#3a3a55" : "#9090b0",
+    strokeWidth: "2.5"
+  }))), /*#__PURE__*/React.createElement("rect", {
+    x: pad.l,
+    y: pad.t,
+    width: ifX - pad.l,
+    height: H,
+    fill: T.liqBg,
+    opacity: "0.45"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: ifX,
+    y: pad.t,
+    width: rightX - ifX,
+    height: H,
+    fill: dark ? "#1e1e2e" : "#d8d8e8",
+    opacity: "0.5"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: ifX,
+    y: pad.t,
+    width: rightX - ifX,
+    height: H,
+    fill: `url(#${hatchId})`,
+    opacity: "0.35"
+  }), eTicks.map(v => {
+    const sy = syFromE(v);
+    return /*#__PURE__*/React.createElement("line", {
+      key: v,
+      x1: pad.l,
+      x2: rightX,
+      y1: sy,
+      y2: sy,
+      stroke: T.grid,
+      strokeWidth: "0.7",
+      strokeDasharray: "3,3"
+    });
+  }), /*#__PURE__*/React.createElement("line", {
+    x1: ifX,
+    x2: ifX,
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: T.text,
+    strokeWidth: "2"
+  }), vacRefOk && /*#__PURE__*/React.createElement("g", null, /*#__PURE__*/React.createElement("line", {
+    x1: pad.l,
+    x2: ifX,
+    y1: vacRefY,
+    y2: vacRefY,
+    stroke: "#1a8fc0",
+    strokeWidth: "1.8",
+    strokeDasharray: "8,4",
+    opacity: "0.9"
+  }), /*#__PURE__*/React.createElement("text", {
+    x: pad.l + 8,
+    y: vacRefY - 5,
+    fontSize: "9",
+    fill: "#1a8fc0",
+    fontFamily: "'DM Mono',monospace",
+    opacity: "0.95"
+  }, /*#__PURE__*/React.createElement("tspan", null, "E"), /*#__PURE__*/React.createElement("tspan", {
+    baselineShift: "sub",
+    fontSize: "7"
+  }, "vac"), /*#__PURE__*/React.createElement("tspan", null, "(liq bulk) = −4.44 eV vs vac")), /*#__PURE__*/React.createElement("circle", {
+    cx: pad.l + 3,
+    cy: vacRefY,
+    r: "3",
+    fill: "#1a8fc0",
+    opacity: "0.75"
+  })), curves.map((c, i) => {
+    if (!c.d_nm) return null;
+    const sxOHP = toSVG(-c.d_nm, 0).sx;
+    const sxIHP = toSVG(0, 0).sx;
+    if (sxOHP < pad.l || sxOHP > sxIHP) return null;
+    return /*#__PURE__*/React.createElement("g", {
+      key: "stern-bd-" + i
+    }, /*#__PURE__*/React.createElement("rect", {
+      x: sxOHP,
+      y: pad.t,
+      width: Math.max(1, sxIHP - sxOHP),
+      height: H,
+      fill: dark ? "rgba(176,96,159,0.15)" : "rgba(176,96,159,0.10)"
+    }), /*#__PURE__*/React.createElement("line", {
+      x1: sxOHP,
+      x2: sxOHP,
+      y1: pad.t,
+      y2: pad.t + H,
+      stroke: "#b0609f",
+      strokeWidth: "1.2",
+      strokeDasharray: "4,3",
+      opacity: "0.7"
+    }), i === 0 && /*#__PURE__*/React.createElement("text", {
+      x: sxOHP - 3,
+      y: pad.t + 10,
+      fontSize: "8.5",
+      fill: "#b0609f",
+      textAnchor: "end",
+      fontFamily: "'DM Mono',monospace"
+    }, "OHP"));
+  }), bandData.map((b, bi) => {
+    const color = multiCurve ? curves[bi].color : null;
+    const vacC = color ?? "#7f3fbf",
+      efC = color ?? "#1e8449";
+    const sw = multiCurve ? 1.6 : 2.2;
+    // E_vac of the metal bulk: constant = 0 (by our convention, φ(x→+∞)=Φ_total, E_vac=0)
+    const efY = syFromE(b.ef);
+    const vacMetalY = syFromE(0); // E_vac(metal bulk) = 0 eV vs vac
+    // WF arrow
+    const arrowX = rightX - 8;
+    return /*#__PURE__*/React.createElement("g", {
+      key: bi,
+      opacity: multiCurve ? 0.85 : 1
+    }, /*#__PURE__*/React.createElement("path", {
+      d: makePath(b.liqPts, "vac"),
+      fill: "none",
+      stroke: vacC,
+      strokeWidth: sw * 0.8,
+      strokeDasharray: "6,3"
+    }), /*#__PURE__*/React.createElement("line", {
+      x1: ifX,
+      x2: rightX,
+      y1: vacMetalY,
+      y2: vacMetalY,
+      stroke: vacC,
+      strokeWidth: sw * 0.8,
+      strokeDasharray: "6,3"
+    }), /*#__PURE__*/React.createElement("line", {
+      x1: pad.l,
+      x2: rightX,
+      y1: efY,
+      y2: efY,
+      stroke: efC,
+      strokeWidth: sw,
+      strokeDasharray: "9,4"
+    }), !multiCurve && /*#__PURE__*/React.createElement("g", {
+      stroke: "#b0609f",
+      strokeWidth: "1.2"
+    }, /*#__PURE__*/React.createElement("line", {
+      x1: arrowX,
+      x2: arrowX,
+      y1: vacMetalY,
+      y2: efY
+    }), /*#__PURE__*/React.createElement("line", {
+      x1: arrowX - 4,
+      x2: arrowX,
+      y1: vacMetalY + 4,
+      y2: vacMetalY
+    }), /*#__PURE__*/React.createElement("line", {
+      x1: arrowX + 4,
+      x2: arrowX,
+      y1: vacMetalY + 4,
+      y2: vacMetalY
+    }), /*#__PURE__*/React.createElement("line", {
+      x1: arrowX - 4,
+      x2: arrowX,
+      y1: efY - 4,
+      y2: efY
+    }), /*#__PURE__*/React.createElement("line", {
+      x1: arrowX + 4,
+      x2: arrowX,
+      y1: efY - 4,
+      y2: efY
+    }), /*#__PURE__*/React.createElement("text", {
+      x: arrowX + 6,
+      y: (vacMetalY + efY) / 2 + 4,
+      fontSize: "10",
+      fill: "#b0609f",
+      fontFamily: "'DM Mono',monospace",
+      fontStyle: "italic"
+    }, /*#__PURE__*/React.createElement("tspan", null, "Φ"), /*#__PURE__*/React.createElement("tspan", {
+      baselineShift: "sub",
+      fontSize: "8"
+    }, "WF"))));
+  }), curves.map((c, i) => {
+    if (!c.lambda_D_nm) return null;
+    const {
+      sx
+    } = toSVG(-c.lambda_D_nm, 0);
+    if (sx < pad.l || sx > ifX) return null;
+    return /*#__PURE__*/React.createElement("g", {
+      key: `ld-${i}`
+    }, /*#__PURE__*/React.createElement("line", {
+      x1: sx,
+      x2: sx,
+      y1: pad.t,
+      y2: pad.t + H,
+      stroke: "#1a8fc0",
+      strokeWidth: "1.1",
+      strokeDasharray: "4,3",
+      opacity: "0.7"
+    }), i === 0 && /*#__PURE__*/React.createElement("text", {
+      x: sx - 3,
+      y: pad.t + 10,
+      textAnchor: "end",
+      fontSize: "8.5",
+      fill: "#1a8fc0",
+      fontFamily: "'DM Mono',monospace",
+      opacity: "0.9"
+    }, /*#__PURE__*/React.createElement("tspan", null, "λ"), /*#__PURE__*/React.createElement("tspan", {
+      baselineShift: "sub",
+      fontSize: "7"
+    }, "D")));
+  }), !multiCurve && bandData.length > 0 && (() => {
+    const b = bandData[0],
+      lLiq = b.liqPts[0],
+      efY = syFromE(b.ef);
+    return /*#__PURE__*/React.createElement("g", {
+      fontSize: "10.5",
+      fontFamily: "'DM Mono',monospace"
+    }, /*#__PURE__*/React.createElement("text", {
+      x: rightX - 18,
+      y: syFromE(0) - 5,
+      textAnchor: "end",
+      fill: "#7f3fbf",
+      fontStyle: "italic"
+    }, /*#__PURE__*/React.createElement("tspan", null, "E"), /*#__PURE__*/React.createElement("tspan", {
+      baselineShift: "sub",
+      fontSize: "8"
+    }, "vac")), /*#__PURE__*/React.createElement("text", {
+      x: pad.l + W * 0.78,
+      y: efY - 5,
+      textAnchor: "middle",
+      fill: "#1e8449",
+      fontWeight: "700"
+    }, /*#__PURE__*/React.createElement("tspan", null, "E"), /*#__PURE__*/React.createElement("tspan", {
+      baselineShift: "sub",
+      fontSize: "8"
+    }, "F")), /*#__PURE__*/React.createElement("text", {
+      x: pad.l + W * 0.2,
+      y: efY - 5,
+      textAnchor: "middle",
+      fill: "#1e8449",
+      fontWeight: "700"
+    }, /*#__PURE__*/React.createElement("tspan", null, "E"), /*#__PURE__*/React.createElement("tspan", {
+      baselineShift: "sub",
+      fontSize: "8"
+    }, "F"), /*#__PURE__*/React.createElement("tspan", null, " = μ"), /*#__PURE__*/React.createElement("tspan", {
+      baselineShift: "sub",
+      fontSize: "8"
+    }, "elec")));
+  })(), /*#__PURE__*/React.createElement("line", {
+    x1: rightX,
+    x2: rightX,
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: T.muted,
+    strokeWidth: "1.2"
+  }), eTicks.map(v => {
+    const sy = syFromE(v);
+    return /*#__PURE__*/React.createElement("g", {
+      key: v
+    }, /*#__PURE__*/React.createElement("line", {
+      x1: rightX,
+      x2: rightX + 4,
+      y1: sy,
+      y2: sy,
+      stroke: T.muted,
+      strokeWidth: "1"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: rightX + 7,
+      y: sy + 4,
+      textAnchor: "start",
+      fontSize: "10",
+      fill: T.textSub
+    }, v.toFixed(1)));
+  }), /*#__PURE__*/React.createElement("text", {
+    transform: `rotate(90,${width - 11},${pad.t + H / 2})`,
+    x: width - 11,
+    y: pad.t + H / 2,
+    textAnchor: "middle",
+    fontSize: "11",
+    fill: T.textSub
+  }, "Energy (eV vs vac)"), /*#__PURE__*/React.createElement("line", {
+    x1: pad.l,
+    x2: pad.l,
+    y1: pad.t,
+    y2: pad.t + H,
+    stroke: "#1c5a8a",
+    strokeWidth: "1.2"
+  }), sheTicks.map(v => {
+    const sy = syFromE(curves[0].phiTotal - v - 4.44);
+    if (sy < pad.t - 2 || sy > pad.t + H + 2) return null;
+    return /*#__PURE__*/React.createElement("g", {
+      key: v
+    }, /*#__PURE__*/React.createElement("line", {
+      x1: pad.l - 4,
+      x2: pad.l,
+      y1: sy,
+      y2: sy,
+      stroke: "#1c5a8a",
+      strokeWidth: "1"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: pad.l - 7,
+      y: sy + 4,
+      textAnchor: "end",
+      fontSize: "10",
+      fill: "#1c5a8a"
+    }, v % 1 === 0 ? v.toFixed(0) : v.toFixed(1)));
+  }), (() => {
+    const sy0 = syFromE(curves[0].phiTotal - 4.44);
+    if (sy0 < pad.t || sy0 > pad.t + H) return null;
+    return /*#__PURE__*/React.createElement("line", {
+      x1: pad.l,
+      x2: ifX,
+      y1: sy0,
+      y2: sy0,
+      stroke: "#1c5a8a",
+      strokeWidth: "0.8",
+      strokeDasharray: "4,3",
+      opacity: "0.5"
+    });
+  })(), /*#__PURE__*/React.createElement("text", {
+    transform: `rotate(-90,11,${pad.t + H / 2})`,
+    x: 11,
+    y: pad.t + H / 2,
+    textAnchor: "middle",
+    fontSize: "11",
+    fill: "#1c5a8a"
+  }, "E (V vs SHE) ↓"), (() => {
+    const xSpan = xMax - xMin;
+    const step = xSpan <= 2 ? 0.5 : xSpan <= 5 ? 1 : xSpan <= 12 ? 2 : 5;
+    const ticks = [];
+    for (let v = Math.ceil(xMin / step) * step; v <= xMax + 1e-9; v += step) ticks.push(parseFloat(v.toFixed(4)));
+    return /*#__PURE__*/React.createElement("g", null, /*#__PURE__*/React.createElement("line", {
+      x1: pad.l,
+      x2: rightX,
+      y1: pad.t + H,
+      y2: pad.t + H,
+      stroke: T.muted,
+      strokeWidth: "1.2"
+    }), ticks.map(x => {
+      const {
+        sx
+      } = toSVG(x, 0);
+      return /*#__PURE__*/React.createElement("g", {
+        key: x
+      }, /*#__PURE__*/React.createElement("line", {
+        x1: sx,
+        x2: sx,
+        y1: pad.t + H,
+        y2: pad.t + H + 5,
+        stroke: T.muted,
+        strokeWidth: "1"
+      }), /*#__PURE__*/React.createElement("text", {
+        x: sx,
+        y: pad.t + H + 17,
+        textAnchor: "middle",
+        fontSize: "10",
+        fill: T.textSub
+      }, Number.isInteger(x) ? x : x.toFixed(1)));
+    }));
+  })(), "      ", /*#__PURE__*/React.createElement("text", {
+    x: pad.l + W / 2,
+    y: height - 4,
+    textAnchor: "middle",
+    fontSize: "11",
+    fill: T.textSub
+  }, "Position x (nm)"), /*#__PURE__*/React.createElement("text", {
+    x: (pad.l + ifX) / 2,
+    y: pad.t + 12,
+    textAnchor: "middle",
+    fontSize: "10.5",
+    fill: "#1c5a8a",
+    fontWeight: "600"
+  }, "Electrolyte"), /*#__PURE__*/React.createElement("text", {
+    x: (ifX + rightX) / 2,
+    y: pad.t + 12,
+    textAnchor: "middle",
+    fontSize: "10.5",
+    fill: dark ? "#aaaacc" : "#4a4a6a",
+    fontWeight: "600"
+  }, "Metal"));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TOOLTIP
+// ═══════════════════════════════════════════════════════════════════
+function Tooltip({
+  tooltip,
+  dark
+}) {
+  if (!tooltip) return null;
+  const T = dark ? DARK : LIGHT;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "fixed",
+      left: tooltip.x + 14,
+      top: tooltip.y - 10,
+      zIndex: 9999,
+      background: T.surface,
+      border: `1px solid ${T.border}`,
+      borderRadius: 7,
+      padding: "7px 11px",
+      pointerEvents: "none",
+      fontSize: 10.5,
+      fontFamily: "'DM Mono',monospace",
+      boxShadow: "0 4px 20px rgba(0,0,0,0.22)",
+      color: T.text,
+      minWidth: 130
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      marginBottom: 4,
+      color: T.accent
+    }
+  }, "x = ", tooltip.x_nm, " nm"), tooltip.rows?.map((r, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 5,
+      marginBottom: 2
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      width: 8,
+      height: 8,
+      borderRadius: "50%",
+      background: r.color,
+      display: "inline-block",
+      flexShrink: 0
+    }
+  }), tooltip.band ? /*#__PURE__*/React.createElement("span", null, r.label || "", " CBM:", r.cbm, " VBM:", r.vbm, " E_F:", r.ef, " eV") : /*#__PURE__*/React.createElement("span", null, r.label || "", " φ=", r.phi, " mV"))));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SLIDER
+// ═══════════════════════════════════════════════════════════════════
+function Slider({
+  label,
+  value,
+  min,
+  max,
+  step,
+  onChange,
+  format,
+  unit,
+  color,
+  parse,
+  validate,
+  dark
+}) {
+  const T = dark ? DARK : LIGHT;
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const inputRef = useRef(null);
+  const clamp = v => Math.min(max, Math.max(min, v));
+  const pct = (value - min) / (max - min) * 100;
+  const startEdit = () => {
+    setDraft(format(value));
+    setEditing(true);
+    setTimeout(() => inputRef.current?.select(), 0);
+  };
+  const commitEdit = () => {
+    const num = parse ? parse(draft) : parseFloat(draft);
+    if (!isNaN(num) && (!validate || validate(num))) onChange(clamp(num));
+    setEditing(false);
+  };
+  const handleKey = e => {
+    if (e.key === "Enter") commitEdit();
+    if (e.key === "Escape") setEditing(false);
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 13
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      marginBottom: 3
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: T.textSub,
+      fontFamily: "'DM Mono',monospace",
+      flex: 1,
+      paddingRight: 6
+    },
+    dangerouslySetInnerHTML: {
+      __html: label
+    }
+  }), editing ? /*#__PURE__*/React.createElement("input", {
+    ref: inputRef,
+    value: draft,
+    onChange: e => setDraft(e.target.value),
+    onBlur: commitEdit,
+    onKeyDown: handleKey,
+    style: {
+      fontSize: 11,
+      fontWeight: 700,
+      color: color ?? "#1a6fa8",
+      fontFamily: "'DM Mono',monospace",
+      minWidth: 86,
+      textAlign: "right",
+      cursor: "text",
+      padding: "1px 5px",
+      borderRadius: 3,
+      border: `1px solid ${color ?? "#1a6fa8"}`,
+      background: dark ? "#0d2137" : "#f0f7ff",
+      outline: "none",
+      width: 86
+    }
+  }) : /*#__PURE__*/React.createElement("span", {
+    onClick: startEdit,
+    title: "Click to type a value",
+    style: {
+      fontSize: 11,
+      fontWeight: 700,
+      color: color ?? "#1a6fa8",
+      fontFamily: "'DM Mono',monospace",
+      minWidth: 86,
+      textAlign: "right",
+      cursor: "pointer",
+      padding: "1px 5px",
+      borderRadius: 3,
+      border: "1px solid transparent",
+      userSelect: "none"
+    }
+  }, format(value), unit ? "\u00a0" + unit : "")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "relative",
+      height: 6,
+      background: T.border,
+      borderRadius: 3
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute",
+      left: 0,
+      width: `${Math.min(100, Math.max(0, pct))}%`,
+      height: "100%",
+      background: color ?? "#1a6fa8",
+      borderRadius: 3,
+      transition: "width 0.04s"
+    }
+  }), /*#__PURE__*/React.createElement("input", {
+    type: "range",
+    min: min,
+    max: max,
+    step: step,
+    value: value,
+    onChange: e => onChange(parseFloat(e.target.value)),
+    style: {
+      position: "absolute",
+      inset: 0,
+      width: "100%",
+      height: "100%",
+      opacity: 0,
+      cursor: "pointer",
+      margin: 0
+    }
+  })));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  PILL
+// ═══════════════════════════════════════════════════════════════════
+function Pill({
+  label,
+  value,
+  unit,
+  color,
+  dark
+}) {
+  const T = dark ? DARK : LIGHT;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "center",
+      padding: "6px 10px",
+      background: T.pill,
+      border: `1px solid ${color}44`,
+      borderTop: `2px solid ${color}`,
+      borderRadius: 5,
+      minWidth: 90
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9.5,
+      color: T.muted,
+      marginBottom: 1
+    }
+  }, label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      fontWeight: 700,
+      color: T.text,
+      fontFamily: "'DM Mono',monospace"
+    }
+  }, value, " ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      fontWeight: 400,
+      color: T.muted
+    }
+  }, unit)));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  EXPORT
+// ═══════════════════════════════════════════════════════════════════
+function exportCSV(curves) {
+  const rows = [["x_nm", ...curves.map((_, i) => `phi_mV_curve${i}`)]];
+  const pts = curves[0] ? [...curves[0].liq, ...curves[0].sol] : [];
+  pts.forEach((p, pi) => {
+    const row = [p.x.toFixed(4)];
+    curves.forEach(c => {
+      const all = [...c.liq, ...c.sol];
+      row.push(all[pi]?.phi?.toFixed(3) ?? "");
+    });
+    rows.push(row);
+  });
+  const a = document.createElement("a");
+  a.href = "data:text/csv;charset=utf-8," + encodeURIComponent(rows.map(r => r.join(",")).join("\n"));
+  a.download = "interface_profile.csv";
+  a.click();
+}
+function exportSVG() {
+  const svgEl = document.querySelector("#chart-svg-root svg");
+  if (!svgEl) return;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([new XMLSerializer().serializeToString(svgEl)], {
+    type: "image/svg+xml"
+  }));
+  a.download = "interface_chart.svg";
+  a.click();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SECTION HEAD
+// ═══════════════════════════════════════════════════════════════════
+function SectionHead({
+  label,
+  open,
+  onToggle,
+  dark
+}) {
+  const T = dark ? DARK : LIGHT;
+  return /*#__PURE__*/React.createElement("div", {
+    onClick: onToggle,
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      cursor: "pointer",
+      marginBottom: open ? 8 : 0,
+      paddingBottom: 4,
+      borderBottom: `1px solid ${T.border}`,
+      userSelect: "none"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10.5,
+      color: T.muted,
+      fontWeight: 700,
+      textTransform: "uppercase",
+      letterSpacing: "0.5px"
+    }
+  }, label), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 13,
+      color: T.muted,
+      lineHeight: 1
+    }
+  }, open ? "▾" : "▸"));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ELECTRODE TYPE TOGGLE
+// ═══════════════════════════════════════════════════════════════════
+function ElectrodeToggle({
+  isMetal,
+  onChange,
+  dark
+}) {
+  const T = dark ? DARK : LIGHT;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 0,
+      borderRadius: 7,
+      overflow: "hidden",
+      border: `1px solid ${T.border}`,
+      width: "fit-content"
+    }
+  }, [{
+    id: false,
+    label: "⬡ Semiconductor"
+  }, {
+    id: true,
+    label: "◈ Metal"
+  }].map(opt => /*#__PURE__*/React.createElement("button", {
+    key: String(opt.id),
+    onClick: () => onChange(opt.id),
+    style: {
+      padding: "5px 16px",
+      fontSize: 11.5,
+      cursor: "pointer",
+      border: "none",
+      borderRight: opt.id === false ? `1px solid ${T.border}` : "none",
+      background: isMetal === opt.id ? opt.id ? "#3a3a5c" : "#1a4a6a" : T.bg,
+      color: isMetal === opt.id ? opt.id ? "#b0b0e0" : "#7aafd4" : T.muted,
+      fontWeight: isMetal === opt.id ? 700 : 400,
+      fontFamily: "'DM Mono',monospace",
+      transition: "all 0.15s",
+      letterSpacing: "0.3px"
+    }
+  }, opt.label)));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  MAIN COMPONENT
+// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+//  DISCLAIMER BANNER
+// ═══════════════════════════════════════════════════════════════════
+function DisclaimerBanner({
+  dark
+}) {
+  const T = dark ? DARK : LIGHT;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: dark ? "rgba(176,96,159,0.12)" : "rgba(176,96,159,0.08)",
+      borderBottom: "1px solid " + (dark ? "rgba(176,96,159,0.35)" : "rgba(176,96,159,0.3)"),
+      padding: "7px 24px",
+      fontSize: 11,
+      lineHeight: 1.5,
+      color: dark ? "#d0a8c5" : "#7a3f68",
+      fontFamily: "'DM Sans',sans-serif"
+    }
+  }, /*#__PURE__*/React.createElement("b", null, "Work in progress"), " — this simulator is a teaching and research aid, not a validated reference tool. Some models, approximations, or edge cases may contain errors. If you spot one, please get in touch so it can be corrected.");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  PHYSICS & METHODS DOCUMENTATION PAGE
+// ═══════════════════════════════════════════════════════════════════
+function PhysicsDocsPage({
+  dark
+}) {
+  const T = dark ? DARK : LIGHT;
+  const Section = ({
+    title,
+    children
+  }) => /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 28
+    }
+  }, /*#__PURE__*/React.createElement("h2", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      color: T.text,
+      marginBottom: 10,
+      borderBottom: "2px solid " + T.accent,
+      paddingBottom: 6,
+      display: "inline-block"
+    }
+  }, title), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: T.text,
+      lineHeight: 1.75
+    }
+  }, children));
+  const Eq = ({
+    children
+  }) => /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: T.surfaceB,
+      border: "1px solid " + T.border,
+      borderRadius: 6,
+      padding: "9px 14px",
+      margin: "8px 0",
+      fontFamily: "'DM Mono',monospace",
+      fontSize: 12.5,
+      color: T.text,
+      overflowX: "auto"
+    }
+  }, children);
+  const P = ({
+    children
+  }) => /*#__PURE__*/React.createElement("p", {
+    style: {
+      marginBottom: 8
+    }
+  }, children);
+  const Code = ({
+    children
+  }) => /*#__PURE__*/React.createElement("code", {
+    style: {
+      fontFamily: "'DM Mono',monospace",
+      background: T.surfaceB,
+      padding: "1px 5px",
+      borderRadius: 3,
+      fontSize: 11.5
+    }
+  }, children);
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxWidth: 820,
+      margin: "0 auto",
+      padding: "28px 24px 60px"
+    }
+  }, /*#__PURE__*/React.createElement("h1", {
+    style: {
+      fontSize: 22,
+      fontWeight: 800,
+      color: T.text,
+      marginBottom: 6
+    }
+  }, "Physics & Methods"), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 12.5,
+      color: T.muted,
+      marginBottom: 26,
+      lineHeight: 1.6
+    }
+  }, "This page documents every equation and numerical method used by the simulator, in the order the calculation actually proceeds: electrolyte chemistry → electrode electronics → self-consistent potential split → charge/field profiles → visual layer (ion strip)."), /*#__PURE__*/React.createElement(Section, {
+    title: "1. Overview of the model"
+  }, /*#__PURE__*/React.createElement(P, null, "The simulator computes the equilibrium electrostatic potential profile φ(x) across a planar electrode/electrolyte interface, for two electrode types (semiconductor or metal), under the classical mean-field (Poisson–Boltzmann) approximation. The interface sits at x = 0: x < 0 is the electrolyte, x > 0 is the electrode."), /*#__PURE__*/React.createElement(P, null, "The whole problem reduces to one number, ", /*#__PURE__*/React.createElement("b", null, "Φ", /*#__PURE__*/React.createElement("sub", null, "total")), ", the difference between the electron energy levels on the electrode side and the redox level of the electrolyte far from the surface — everything else (band bending, diffuse-layer structure, charge densities) follows from imposing charge neutrality of the whole system for a given Φ", /*#__PURE__*/React.createElement("sub", null, "total"), ".")), /*#__PURE__*/React.createElement(Section, {
+    title: "2. Electrolyte chemistry reference level"
+  }, /*#__PURE__*/React.createElement(P, null, "The electrolyte's electrochemical potential (vs. vacuum) is modelled as a function of pH only, using the standard hydrogen electrode convention shifted to the absolute vacuum scale:"), /*#__PURE__*/React.createElement(Eq, null, "μ", /*#__PURE__*/React.createElement("sub", null, "elec"), " = −5.055 + 0.059 · pH \xA0 [eV vs. vacuum]"), /*#__PURE__*/React.createElement(P, null, "The −5.055 eV term places the SHE (standard hydrogen electrode) on the absolute vacuum scale (Trasatti convention); the 0.059 eV/pH (T = 298 K) Nernstian slope shifts the redox level with pH.")), /*#__PURE__*/React.createElement(Section, {
+    title: "3. Electrode reference level and Φ_total"
+  }, /*#__PURE__*/React.createElement(P, null, "The electrode is characterised by its work function Φ", /*#__PURE__*/React.createElement("sub", null, "WF"), " (metal) or its electron affinity χ and band gap E", /*#__PURE__*/React.createElement("sub", null, "g"), " (semiconductor). The total potential drop across the whole interface, from bulk electrode to bulk electrolyte, is:"), /*#__PURE__*/React.createElement(Eq, null, "Φ", /*#__PURE__*/React.createElement("sub", null, "total"), " = −Φ", /*#__PURE__*/React.createElement("sub", null, "WF"), " − μ", /*#__PURE__*/React.createElement("sub", null, "elec"), "(pH) \xA0 [V]"), /*#__PURE__*/React.createElement(P, null, "This Φ", /*#__PURE__*/React.createElement("sub", null, "total"), " is the single driving parameter for everything downstream: it must be split self-consistently between the semiconductor depletion layer (or metal surface charge) and the electrolyte diffuse layer such that the whole system is charge neutral.")), /*#__PURE__*/React.createElement(Section, {
+    title: "4. Semiconductor electrode — depletion approximation"
+  }, /*#__PURE__*/React.createElement(P, null, "For a semiconductor with (uniform) acceptor doping N", /*#__PURE__*/React.createElement("sub", null, "A"), ", the classical depletion approximation gives a parabolic potential profile inside the solid:"), /*#__PURE__*/React.createElement(Eq, null, "φ(x) = Φ", /*#__PURE__*/React.createElement("sub", null, "total"), " − φ", /*#__PURE__*/React.createElement("sub", null, "s"), "·((W−x)/W)² \xA0 for 0 ≤ x ≤ W, \xA0 φ(x) = Φ", /*#__PURE__*/React.createElement("sub", null, "total"), " for x > W"), /*#__PURE__*/React.createElement(P, null, "where φ", /*#__PURE__*/React.createElement("sub", null, "s"), " = Φ", /*#__PURE__*/React.createElement("sub", null, "total"), " − V", /*#__PURE__*/React.createElement("sub", null, "H"), " is the band-bending (surface potential relative to bulk), V", /*#__PURE__*/React.createElement("sub", null, "H"), " is the potential right at the interface (x = 0), and the depletion width is:"), /*#__PURE__*/React.createElement(Eq, null, "W = √( 2·ε", /*#__PURE__*/React.createElement("sub", null, "s"), "·|φ", /*#__PURE__*/React.createElement("sub", null, "s"), "| / (e·N", /*#__PURE__*/React.createElement("sub", null, "A"), ") )"), /*#__PURE__*/React.createElement(P, null, "The associated space-charge density is uniform inside the depletion region:"), /*#__PURE__*/React.createElement(Eq, null, "ρ", /*#__PURE__*/React.createElement("sub", null, "SC"), "(x) = sign(φ", /*#__PURE__*/React.createElement("sub", null, "s"), ") · e·N", /*#__PURE__*/React.createElement("sub", null, "A"), " \xA0 (0 ≤ x < W), \xA0 0 elsewhere"), /*#__PURE__*/React.createElement(P, null, "Note: the model does not assume p-type acceptor doping specifically — the sign of the space-charge simply follows the sign of φ", /*#__PURE__*/React.createElement("sub", null, "s"), " found by the solver, so both depletion and accumulation-like regimes are represented on the same footing.")), /*#__PURE__*/React.createElement(Section, {
+    title: "5. Electrolyte diffuse layer — Gouy–Chapman theory"
+  }, /*#__PURE__*/React.createElement(P, null, "On the electrolyte side, ionic screening is treated with the classical 1D Poisson–Boltzmann (Gouy–Chapman) solution for a symmetric z:z electrolyte (z = 1 here), giving the well-known closed-form potential profile:"), /*#__PURE__*/React.createElement(Eq, null, "φ(x) = (4kT/e) · artanh( γ·exp(κx) ), \xA0 γ = tanh(e·V", /*#__PURE__*/React.createElement("sub", null, "H"), " / 4kT)"), /*#__PURE__*/React.createElement(P, null, "where κ", /*#__PURE__*/React.createElement("sup", null, "−1"), " = λ", /*#__PURE__*/React.createElement("sub", null, "D"), " is the Debye length:"), /*#__PURE__*/React.createElement(Eq, null, "λ", /*#__PURE__*/React.createElement("sub", null, "D"), " = √( ε", /*#__PURE__*/React.createElement("sub", null, "f"), "·kT / (2·e²·c₀) )"), /*#__PURE__*/React.createElement(P, null, "and the corresponding charge density and diffuse-layer charge (per unit area) are:"), /*#__PURE__*/React.createElement(Eq, null, "ρ", /*#__PURE__*/React.createElement("sub", null, "liq"), "(x) = −2e·c₀·sinh(e·φ(x)/kT)"), /*#__PURE__*/React.createElement(Eq, null, "Q", /*#__PURE__*/React.createElement("sub", null, "diff"), " = Q₀·sinh(e·V", /*#__PURE__*/React.createElement("sub", null, "H"), "/2kT), \xA0 Q₀ = √(8·ε", /*#__PURE__*/React.createElement("sub", null, "f"), "·kT·c₀)")), /*#__PURE__*/React.createElement(Section, {
+    title: "6. Self-consistent potential split (charge balance)"
+  }, /*#__PURE__*/React.createElement(P, null, "V", /*#__PURE__*/React.createElement("sub", null, "H"), " (the potential at x = 0⁻, i.e. right at the interface, seen from the electrolyte side) is found by requiring exact charge neutrality of the whole system — electrode space charge, diffuse-layer charge, any fixed surface charge, and any surface trapped charge (see §9) must sum to zero:"), /*#__PURE__*/React.createElement(Eq, null, "Q", /*#__PURE__*/React.createElement("sub", null, "SC"), "(φ", /*#__PURE__*/React.createElement("sub", null, "s"), ") + Q", /*#__PURE__*/React.createElement("sub", null, "diff"), "(V", /*#__PURE__*/React.createElement("sub", null, "H"), ") + σ", /*#__PURE__*/React.createElement("sub", null, "fixed"), " + Q", /*#__PURE__*/React.createElement("sub", null, "ss"), "(φ", /*#__PURE__*/React.createElement("sub", null, "s"), ") = 0, \xA0 φ", /*#__PURE__*/React.createElement("sub", null, "s"), " = Φ", /*#__PURE__*/React.createElement("sub", null, "total"), " − V", /*#__PURE__*/React.createElement("sub", null, "H")), /*#__PURE__*/React.createElement(P, null, "This transcendental equation is solved numerically for V", /*#__PURE__*/React.createElement("sub", null, "H"), " using", /*#__PURE__*/React.createElement("b", null, " Brent's method"), " (a bracketed root-finder combining bisection, secant, and inverse quadratic interpolation), bracketed within (−|Φ", /*#__PURE__*/React.createElement("sub", null, "total"), "|, +|Φ", /*#__PURE__*/React.createElement("sub", null, "total"), "|)."), /*#__PURE__*/React.createElement(P, null, "For the metal electrode, there is no depletion layer (Q", /*#__PURE__*/React.createElement("sub", null, "SC"), " = 0 always), so the balance reduces to V", /*#__PURE__*/React.createElement("sub", null, "H"), " = Φ", /*#__PURE__*/React.createElement("sub", null, "total"), " in the pure Gouy–Chapman case (all the potential drop is absorbed by the diffuse layer).")), /*#__PURE__*/React.createElement(Section, {
+    title: "7. Auto-triggered Stern (compact) layer"
+  }, /*#__PURE__*/React.createElement(P, null, "Pure Gouy–Chapman theory treats ions as point charges, which is unphysical at high surface charge density: it predicts arbitrarily large local ion concentrations. The simulator checks this explicitly and switches on a Stern (compact) layer automatically when the predicted concentration exceeds the physical packing limit of solvated ions."), /*#__PURE__*/React.createElement(P, null, /*#__PURE__*/React.createElement("b", null, "Trigger condition"), " — compare the Gouy–Chapman surface concentration to the 3-D close-packing density of hydrated ions (hexagonal close packing, radius = solvation radius r", /*#__PURE__*/React.createElement("sub", null, "solv"), "):"), /*#__PURE__*/React.createElement(Eq, null, "c", /*#__PURE__*/React.createElement("sub", null, "surf"), " = c₀·exp(|e·V", /*#__PURE__*/React.createElement("sub", null, "H"), "/kT|) \xA0 > \xA0 n", /*#__PURE__*/React.createElement("sub", null, "max,3D"), " = 1 / (4√2 · r", /*#__PURE__*/React.createElement("sub", null, "solv"), "³) \xA0 ⟹ \xA0 Stern layer activates"), /*#__PURE__*/React.createElement(P, null, /*#__PURE__*/React.createElement("b", null, "When triggered"), ", the compact layer is treated as a purely geometric exclusion zone of thickness d = r", /*#__PURE__*/React.createElement("sub", null, "solv"), " between the electrode surface (IHP) and the start of the diffuse layer (OHP, x = −r", /*#__PURE__*/React.createElement("sub", null, "solv"), "). This is the standard Gouy–Chapman–Stern (GCS) construction. For the ", /*#__PURE__*/React.createElement("b", null, "metal"), " electrode, the compact layer also acts as a parallel-plate capacitor in series with the diffuse layer:"), /*#__PURE__*/React.createElement(Eq, null, "C", /*#__PURE__*/React.createElement("sub", null, "H"), " = ε", /*#__PURE__*/React.createElement("sub", null, "H"), "·ε₀ / r", /*#__PURE__*/React.createElement("sub", null, "solv"), ", \xA0\xA0 V", /*#__PURE__*/React.createElement("sub", null, "diff"), " + Q", /*#__PURE__*/React.createElement("sub", null, "diff"), "(V", /*#__PURE__*/React.createElement("sub", null, "diff"), ")/C", /*#__PURE__*/React.createElement("sub", null, "H"), " = Φ", /*#__PURE__*/React.createElement("sub", null, "total")), /*#__PURE__*/React.createElement(P, null, "solved again by Brent's method for V", /*#__PURE__*/React.createElement("sub", null, "diff"), " (the potential at the OHP). This naturally limits how much charge the diffuse layer can hold as Φ", /*#__PURE__*/React.createElement("sub", null, "total"), " grows, replacing the unphysical exponential divergence of pure Gouy–Chapman."), /*#__PURE__*/React.createElement(P, null, "For the ", /*#__PURE__*/React.createElement("b", null, "semiconductor"), " electrode, the charge balance found in §6 is left unchanged (φ", /*#__PURE__*/React.createElement("sub", null, "s"), " and W are not affected) — the Stern layer only changes the geometry of the electrolyte-side profile (where the diffuse layer starts), not the amount of charge. This is a simplification: unlike the metal case, no separate Helmholtz capacitor is currently solved on the semiconductor side.")), /*#__PURE__*/React.createElement(Section, {
+    title: "8. Fixed surface charge (σ_surf)"
+  }, /*#__PURE__*/React.createElement(P, null, "An optional user-set fixed areal charge density can be added directly to the interface (e.g. representing a pre-existing functionalisation or adsorbed layer). It enters the charge-balance equation in §6 as a constant term σ", /*#__PURE__*/React.createElement("sub", null, "fixed"), ", independent of the applied potential.")), /*#__PURE__*/React.createElement(Section, {
+    title: "9. Surface trapped charge (surface states)"
+  }, /*#__PURE__*/React.createElement(P, null, "The semiconductor electrode additionally supports a discrete surface-state trap level, filled according to Fermi-Dirac statistics and referenced to the local (surface) valence-band position — this is what allows Fermi-level pinning to be reproduced. Using the vacuum-level convention of §11:"), /*#__PURE__*/React.createElement(Eq, null, "ξ", /*#__PURE__*/React.createElement("sub", null, "bulk"), " = E", /*#__PURE__*/React.createElement("sub", null, "F"), " − E", /*#__PURE__*/React.createElement("sub", null, "VBM,bulk"), " = −Φ", /*#__PURE__*/React.createElement("sub", null, "WF"), " + χ + E", /*#__PURE__*/React.createElement("sub", null, "g")), /*#__PURE__*/React.createElement(Eq, null, "ξ", /*#__PURE__*/React.createElement("sub", null, "surf"), " = ξ", /*#__PURE__*/React.createElement("sub", null, "bulk"), " − φ", /*#__PURE__*/React.createElement("sub", null, "s"), " \xA0\xA0 (band bending shifts the surface VBM relative to E", /*#__PURE__*/React.createElement("sub", null, "F"), ")"), /*#__PURE__*/React.createElement(Eq, null, "f = 1 / ( 1 + exp( (E", /*#__PURE__*/React.createElement("sub", null, "t"), " − ξ", /*#__PURE__*/React.createElement("sub", null, "surf"), ") / kT ) ) \xA0\xA0 (Fermi–Dirac occupancy of the trap)"), /*#__PURE__*/React.createElement(P, null, "Trapped charge, depending on trap character:"), /*#__PURE__*/React.createElement(Eq, null, "acceptor-like: \xA0 Q", /*#__PURE__*/React.createElement("sub", null, "ss"), " = −e·N", /*#__PURE__*/React.createElement("sub", null, "ss"), "·f \xA0\xA0\xA0 (neutral empty, negative when filled)"), /*#__PURE__*/React.createElement(Eq, null, "donor-like: \xA0\xA0 Q", /*#__PURE__*/React.createElement("sub", null, "ss"), " = +e·N", /*#__PURE__*/React.createElement("sub", null, "ss"), "·(1−f) \xA0\xA0\xA0 (positive empty, neutral when filled)"), /*#__PURE__*/React.createElement(P, null, "Because Q", /*#__PURE__*/React.createElement("sub", null, "ss"), " depends on φ", /*#__PURE__*/React.createElement("sub", null, "s"), " (through ξ", /*#__PURE__*/React.createElement("sub", null, "surf"), "), it enters the self-consistent charge balance of §6 rather than being added as a constant — at large N", /*#__PURE__*/React.createElement("sub", null, "ss"), ", this correctly reproduces Fermi-level pinning: the surface Fermi level is dragged toward E", /*#__PURE__*/React.createElement("sub", null, "t"), " regardless of Φ", /*#__PURE__*/React.createElement("sub", null, "total"), ". This model uses a single discrete trap level; real surfaces often have a continuous distribution of states, which is a possible future refinement.")), /*#__PURE__*/React.createElement(Section, {
+    title: "10. Electric field |E(x)|"
+  }, /*#__PURE__*/React.createElement(P, null, "The field magnitude shown in the |E(x)| panel is obtained directly from the computed potential profile by centred finite differences, computed separately on the liquid and solid branches to avoid contaminating the derivative across the interface discontinuity:"), /*#__PURE__*/React.createElement(Eq, null, "E(x) = −dφ/dx \xA0\xA0 (V/m, via mV/nm × 10⁶)")), /*#__PURE__*/React.createElement(Section, {
+    title: "11. Band diagram construction (semiconductor)"
+  }, /*#__PURE__*/React.createElement(P, null, "The band diagram view converts the potential profile into absolute electron energies using a single global vacuum-level reference. Using E", /*#__PURE__*/React.createElement("sub", null, "vac"), "(bulk electrolyte) ≡ Φ", /*#__PURE__*/React.createElement("sub", null, "total"), " as the reference:"), /*#__PURE__*/React.createElement(Eq, null, "E", /*#__PURE__*/React.createElement("sub", null, "vac"), "(x) = Φ", /*#__PURE__*/React.createElement("sub", null, "total"), " − φ(x)"), /*#__PURE__*/React.createElement(Eq, null, "E", /*#__PURE__*/React.createElement("sub", null, "CBM"), "(x) = E", /*#__PURE__*/React.createElement("sub", null, "vac"), "(x) − χ, \xA0\xA0 E", /*#__PURE__*/React.createElement("sub", null, "VBM"), "(x) = E", /*#__PURE__*/React.createElement("sub", null, "CBM"), "(x) − E", /*#__PURE__*/React.createElement("sub", null, "g")), /*#__PURE__*/React.createElement(Eq, null, "E", /*#__PURE__*/React.createElement("sub", null, "F"), " = −Φ", /*#__PURE__*/React.createElement("sub", null, "WF"), " \xA0 (flat everywhere, equilibrium condition)"), /*#__PURE__*/React.createElement(P, null, "Energies are also convertible to a \"V vs. SHE\" axis via E(V vs. SHE) = E", /*#__PURE__*/React.createElement("sub", null, "vac,liquid bulk"), " − E(eV) − 4.44, using the standard 4.44 eV absolute potential of the SHE.")), /*#__PURE__*/React.createElement(Section, {
+    title: "12. Ion visualisation strip"
+  }, /*#__PURE__*/React.createElement(P, null, "The particle strip above the charts is a ", /*#__PURE__*/React.createElement("i", null, "to-scale"), " visual representation of the calculated charge density, not an independent physical model — every particle drawn is derived from the ρ(x) already computed above."), /*#__PURE__*/React.createElement(P, null, /*#__PURE__*/React.createElement("b", null, "Cross-section convention"), ": the strip treats the out-of-plane depth as equal to the x-axis span currently displayed, so the displayed volume element per column is a cube of side ≈ (x-axis range). This lets ion counts be computed as genuine 3-D densities (ions/nm³) rather than an arbitrary 1-D projection, and it also means the liquid and solid sides are automatically charge-balanced (same cross-section, and Q", /*#__PURE__*/React.createElement("sub", null, "liquid"), " = −Q", /*#__PURE__*/React.createElement("sub", null, "solid"), " by construction from §6)."), /*#__PURE__*/React.createElement(P, null, /*#__PURE__*/React.createElement("b", null, "Electrolyte ions"), ": rendered as two concentric circles — an inner \"bare ion\" radius and an outer dashed \"solvation shell\" radius, both user-adjustable and drawn to the same physical nm scale as the x-axis. Positions are placed with a deterministic hash-based scatter (so they don't flicker on re-render) using a band-based placement algorithm that guarantees the exact target count is always shown (no silent under/over-counting at high or low density)."), /*#__PURE__*/React.createElement(P, null, /*#__PURE__*/React.createElement("b", null, "Semiconductor dopants"), ": rendered as small diamond markers on a staggered (hexagonal-like) lattice, since these charges are fixed to the crystal and not mobile — visually distinct from the free-floating electrolyte ions."), /*#__PURE__*/React.createElement(P, null, /*#__PURE__*/React.createElement("b", null, "Stern layer"), ": when active, rendered as a hexagonally close-packed grid of adsorption sites at the OHP, with an occupied/empty fraction set by the coverage f = n", /*#__PURE__*/React.createElement("sub", null, "ads"), "/n", /*#__PURE__*/React.createElement("sub", null, "max"), " relative to the maximum 2-D packing density 1/(2√3·r", /*#__PURE__*/React.createElement("sub", null, "solv"), "²)."), /*#__PURE__*/React.createElement(P, null, "A large total ion count is down-scaled for legibility (capped around a few dozen markers on screen), but the ", /*#__PURE__*/React.createElement("i", null, "same"), " scale factor is always applied to both sides of the interface, so the displayed ratio always reflects the true physical charge balance even when the absolute numbers are compressed for display.")), /*#__PURE__*/React.createElement(Section, {
+    title: "13. Known simplifications & limitations"
+  }, /*#__PURE__*/React.createElement(P, null, "This is a teaching/exploration tool, not a quantitative research-grade solver. Some known simplifications:"), /*#__PURE__*/React.createElement(P, null, "• 1-D planar geometry only — no lateral structure, curvature, or roughness.", /*#__PURE__*/React.createElement("br", null), "• Point-like Gouy–Chapman ions except where the Stern correction is triggered; no modified Poisson–Boltzmann / steric (Bikerman) correction beyond that.", /*#__PURE__*/React.createElement("br", null), "• Uniform, fully-ionised doping in the semiconductor depletion approximation (no partial ionisation, no exponential band tails).", /*#__PURE__*/React.createElement("br", null), "• Single discrete surface-trap level rather than a continuous density of states.", /*#__PURE__*/React.createElement("br", null), "• Static/DC equilibrium only — no time-dependent or AC (impedance) behaviour.", /*#__PURE__*/React.createElement("br", null), "• Room-temperature dielectric constants and SHE conventions are fixed except where explicit sliders exist (T, ε", /*#__PURE__*/React.createElement("sub", null, "r"), ", etc).")));
+}
+function DiamondInterface() {
+  // Top-level page: "sim" (simulator) or "docs" (physics & methods)
+  const [page, setPage] = useState("sim");
+
+  // Electrode type
+  const [isMetal, setIsMetal] = useState(false);
+
+  // Shared params
+  const [pH, setPH] = useState(7);
+  const [WF, setWF] = useState(5.0);
+  const [logC0, setLogC0] = useState(-1);
+  const [sigmaRaw, setSigmaRaw] = useState(0);
+  // Surface trapped charge (surface states)
+  const [ssOn, setSsOn] = useState(false);
+  const [logNss, setLogNss] = useState(12); // log10 N_ss [cm^-2]
+  const [Et_eV, setEt_eV] = useState(1.0); // trap level above VBM [eV]
+  const [ssType, setSsType] = useState("acceptor");
+  const [Temp, setTemp] = useState(298.15);
+  const [mode, setMode] = useState("free");
+
+  // SC-only params
+  const [logNA, setLogNA] = useState(20);
+  const [epsRel, setEpsRel] = useState(5.7);
+  const [chi, setChi] = useState(-0.3);
+  const [Eg, setEg] = useState(5.47);
+  const [curves, setCurves] = useState([]);
+  const [info, setInfo] = useState(null);
+  const [showBand, setShowBand] = useState(false);
+  const [dark, setDark] = useState(false);
+  const [tooltip, setTooltip] = useState(null);
+  const [panelOpen, setPanelOpen] = useState(true);
+  const [secOpen, setSecOpen] = useState({
+    elec: true,
+    electrode: true,
+    band: true,
+    env: true
+  });
+  const toggleSec = k => setSecOpen(s => ({
+    ...s,
+    [k]: !s[k]
+  }));
+
+  // Panel visibility toggles
+  const [showIons, setShowIons] = useState(true);
+  const [showRho, setShowRho] = useState(true);
+  const [showField, setShowField] = useState(true);
+  const [rIon_A, setRIon_A] = useState(1.5); // bare ion radius [Å]
+  const [rSolv_A, setRSolv_A] = useState(3.5); // solvation shell radius [Å]
+  const [sternEpsH, setSternEpsH] = useState(6.0);
+  const containerRef = useRef(null);
+  const chartCardRef = useRef(null);
+  const [chartW, setChartW] = useState(520);
+  useEffect(() => {
+    const ro = new ResizeObserver(entries => setChartW(Math.max(280, entries[0].contentRect.width - 24)));
+    if (chartCardRef.current) ro.observe(chartCardRef.current);
+    return () => ro.disconnect();
+  }, []);
+
+  // When switching type reset mode to "free" if current mode is invalid
+  useEffect(() => {
+    const validModes = (isMetal ? MODES_METAL : MODES_SC).map(m => m.id);
+    if (!validModes.includes(mode)) setMode("free");
+  }, [isMetal]);
+  const eps_f = 78.4 * eps0;
+  const buildCurve_SC = useCallback((pH_v, WF_v, NA_cm3, c0_M, sigma_cm2, color, label) => {
+    const Phi = phiTotal(pH_v, WF_v);
+    const eps_s = epsRel * eps0;
+    const NA_m3 = NA_cm3 * 1e6;
+    const c0_m3 = c0_M * 1e3 * NA;
+    const sig_SI = sigma_cm2 * 1e4 * e_C;
+    if (Math.abs(Phi) < 1e-4) return null;
+    try {
+      // Surface states: ξ_bulk = E_F − E_VBM(bulk) = −WF + χ + Eg
+      const traps = ssOn ? {
+        N_m2: Math.pow(10, logNss) * 1e4,
+        E_t_eV: Et_eV,
+        type: ssType,
+        xi_bulk_eV: -WF_v + chi + Eg
+      } : null;
+      const V_H = findVH_SC(NA_m3, c0_m3, Phi, eps_s, eps_f, Temp, sig_SI, traps);
+      const prof = getProfile_SC(V_H, NA_m3, c0_m3, Phi, eps_s, eps_f, Temp);
+      const Q_ss = surfaceTrapCharge(prof.phi_s_mV * 1e-3, traps, Temp);
+      const xiSurf = traps ? traps.xi_bulk_eV - prof.phi_s_mV * 1e-3 : null;
+
+      // ── Auto-Stern check ────────────────────────────────────────
+      const r_m = rSolv_A * 0.1e-9; // nm → m
+      const c_surf_GC = c0_m3 * Math.exp(Math.min(50, Math.abs(e_C * V_H / (k_B * Temp))));
+      const n_max_3D = 1 / (4 * Math.sqrt(2) * r_m * r_m * r_m);
+      const autoStern = c_surf_GC > n_max_3D && prof.W_nm > 0;
+      let result = {
+        ...prof,
+        phiTotal: Phi,
+        color,
+        label,
+        mu_eV: muElectrolyte(pH_v),
+        autoStern: false,
+        Q_ss_Cm2: Q_ss,
+        xi_surf_eV: xiSurf,
+        sigmaTot_Cm2: sig_SI + Q_ss
+      };
+      if (autoStern) {
+        // Q_SC from depletion (unchanged — phi_s, W not affected by Stern split)
+        const phi_s = prof.phi_s_mV * 1e-3;
+        const Q_SC = Math.sign(phi_s) * Math.sqrt(2 * e_C * NA_m3 * eps_s * Math.abs(phi_s));
+        const Q0 = Math.sqrt(8 * eps_f * k_B * Temp * c0_m3);
+        const rSolv_nm = rSolv_A * 0.1;
+        // GCS for SC: no fixed σ_Stern — charge balance is same as GC.
+        // The Stern layer is a geometric exclusion zone (d = r_solv).
+        // phi_s and W are unchanged; only the φ profile in electrolyte changes.
+        const Q_diff = -Q_SC - sig_SI - Q_ss; // = Q_liquid (same as GC)
+        // Convention (findVH_SC): Q_liquid = −Q0·sinh(eV/2kT)
+        // → sinh(eV/2kT) = −Q_liquid/Q0 → V = (2kT/e)·asinh(−Q_diff/Q0)
+        const arg_diff = Math.max(-200, Math.min(200, -Q_diff / Q0));
+        const V_diff = 2 * k_B * Temp / e_C * Math.asinh(arg_diff);
+        const V_stern = V_H - V_diff; // = 0: Stern is geometric only
+        // Rebuild liq: diffuse part shifted by r_solv + linear Stern segment
+        const kappa = Math.sqrt(2 * e_C * e_C * c0_m3 / (eps_f * k_B * Temp));
+        const gamma = Math.tanh(e_C * V_diff / (4 * k_B * Temp));
+        const liqSpanNew = Math.max(2 / kappa, 0.5e-9);
+        const liqNew = [];
+        const N_diff2 = 340;
+        for (let i = 0; i < N_diff2; i++) {
+          const x_gc = -liqSpanNew * (1 - i / (N_diff2 - 1));
+          const x = x_gc - r_m;
+          const arg = gamma * Math.exp(kappa * x_gc);
+          const phi = arg >= 1 || arg <= -1 ? Math.sign(arg) * 4 * k_B * Temp / e_C * 15 : 4 * k_B * Temp / e_C * Math.atanh(arg);
+          liqNew.push({
+            x: x * 1e9,
+            phi: phi * 1000
+          });
+        }
+        for (let i = 0; i <= 20; i++) {
+          const t = i / 20;
+          liqNew.push({
+            x: (-r_m + r_m * t) * 1e9,
+            phi: (V_diff + V_stern * t) * 1000
+          });
+        }
+        const C_H = sternEpsH * eps0 / r_m;
+        result = {
+          ...result,
+          liq: liqNew,
+          autoStern: true,
+          d_nm: rSolv_nm,
+          V_H_mV: V_stern * 1000,
+          V_diff_mV: V_diff * 1000,
+          C_H_uFcm2: C_H * 1e-4 * 1e6,
+          xMin_nm: -(liqSpanNew + r_m) * 1e9
+        };
+      }
+      return result;
+    } catch {
+      return null;
+    }
+  }, [epsRel, Temp, rSolv_A, sternEpsH, ssOn, logNss, Et_eV, ssType, chi, Eg]);
+  const buildCurve_Metal = useCallback((pH_v, WF_v, c0_M, color, label) => {
+    const Phi = phiTotal(pH_v, WF_v);
+    const c0_m3 = c0_M * 1e3 * NA;
+    if (Math.abs(Phi) < 1e-4) return null;
+    try {
+      const r = getProfile_Metal(c0_m3, Phi, eps_f, Temp, rSolv_A * 0.1, sternEpsH);
+      return {
+        ...r,
+        phiTotal: Phi,
+        color,
+        label,
+        mu_eV: muElectrolyte(pH_v)
+      };
+    } catch {
+      return null;
+    }
+  }, [Temp, rSolv_A, sternEpsH]);
+  useEffect(() => {
+    const NA_cm3 = Math.pow(10, logNA);
+    const c0_M = Math.pow(10, logC0);
+    const sigma_cm2 = sigmaRaw * 1e13;
+    let built = [];
+    if (isMetal) {
+      if (mode === "free") {
+        const c = buildCurve_Metal(pH, WF, c0_M, "#1a6fa8", "");
+        if (c) {
+          built = [c];
+          setInfo({
+            mu: muElectrolyte(pH).toFixed(3),
+            Phi: (c.phiTotal * 1000).toFixed(1),
+            V_H: c.V_H_mV.toFixed(1),
+            Q_Cm2: c.Q_metal_Cm2 ?? 0,
+            V_diff: c.V_diff_mV != null ? c.V_diff_mV.toFixed(1) : null,
+            C_H: c.C_H_uFcm2 != null ? c.C_H_uFcm2.toFixed(1) : null
+          });
+        }
+      }
+    } else {
+      if (mode === "free") {
+        const c = buildCurve_SC(pH, WF, NA_cm3, c0_M, sigma_cm2, "#1a6fa8", "");
+        if (c) {
+          built = [c];
+          setInfo({
+            mu: muElectrolyte(pH).toFixed(3),
+            Phi: (c.phiTotal * 1000).toFixed(1),
+            V_H: c.V_H_mV.toFixed(1),
+            phi_s: c.phi_s_mV.toFixed(1),
+            W: c.W_nm.toFixed(2),
+            V_diff: c.V_diff_mV != null ? c.V_diff_mV.toFixed(1) : null,
+            Q_ss_Cm2: c.Q_ss_Cm2,
+            xi_surf: c.xi_surf_eV
+          });
+        }
+      } else if (mode === "doping") {
+        built = NA_VALS.map((N, i) => {
+          const exp = Math.round(Math.log10(N));
+          return buildCurve_SC(pH, WF, N, 1.0, 0, PALETTE[i], `N_A=10^${exp} cm⁻³`);
+        }).filter(Boolean);
+        setInfo(null);
+      } else if (mode === "sigma") {
+        built = SIGMAS.map((s, i) => buildCurve_SC(pH, WF, NA_cm3, c0_M, s, SIGMA_COLS[i], `σ=${s.toExponential(0)} cm⁻²`)).filter(Boolean);
+        setInfo(null);
+      }
+    }
+    setCurves(built);
+  }, [isMetal, mode, pH, WF, logNA, logC0, sigmaRaw, ssOn, logNss, Et_eV, ssType, buildCurve_SC, buildCurve_Metal]);
+  const allPhi = curves.flatMap(c => [...c.liq, ...c.sol].map(p => p.phi));
+  const rawMin = allPhi.length ? Math.min(...allPhi) : -600;
+  const rawMax = allPhi.length ? Math.max(...allPhi) : 80;
+  const pad_y = (rawMax - rawMin) * 0.08;
+  const yMin = Math.floor((rawMin - pad_y) / 50) * 50;
+  const yMax = Math.ceil((rawMax + pad_y) / 50) * 50;
+  const chartH = Math.round(chartW * 0.54);
+  const bandH = Math.round(chartW * 0.78); // band diagram: taller for band structure clarity
+
+  // Dynamic x range: use exact curve spans, no coarse rounding
+  const xMin_nm_raw = curves.length ? Math.min(...curves.map(c => c.xMin_nm ?? -6)) : -6;
+  const xMax_nm_raw = curves.length ? Math.max(...curves.map(c => c.xMax_nm ?? 7)) : 7;
+  const xMin_nm = xMin_nm_raw;
+  const xMax_nm = xMax_nm_raw;
+  const PhiDisp = phiTotal(pH, WF) * 1000;
+  const V_fb = flatbandVoltage(pH, WF);
+  const T = dark ? DARK : LIGHT;
+  const MODES = isMetal ? MODES_METAL : MODES_SC;
+  const sliderProps = color => ({
+    color,
+    dark
+  });
+  const fmtConc = v => {
+    const m = Math.pow(10, v);
+    if (v <= -3) return `${(m * 1e6).toFixed(m * 1e6 < 10 ? 2 : 1)} µM`;
+    if (v < 0) return `${(m * 1e3).toFixed(m * 1e3 < 10 ? 2 : 1)} mM`;
+    return `${m.toFixed(2)} M`;
+  };
+  const VIEW_TABS = [{
+    id: "phi",
+    label: "φ(x) potential"
+  }, {
+    id: "band",
+    label: "Band diagram"
+  }];
+  const activeView = showBand ? "band" : "phi";
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'DM Sans','Helvetica Neue',sans-serif",
+      background: T.bg,
+      minHeight: "100vh",
+      transition: "background 0.25s"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: T.header,
+      padding: "12px 24px 10px",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      flexWrap: "wrap",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 18,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 17,
+      fontWeight: 800,
+      color: T.headerTxt,
+      letterSpacing: "-0.4px"
+    }
+  }, "Electrode / Electrolyte Interface"), page === "sim" && /*#__PURE__*/React.createElement(ElectrodeToggle, {
+    isMetal: isMetal,
+    onChange: v => {
+      setIsMetal(v);
+      setMode("free");
+    },
+    dark: dark
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      borderRadius: 6,
+      overflow: "hidden",
+      border: "1px solid #2c5070"
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setPage("sim"),
+    style: {
+      fontSize: 11,
+      padding: "4px 12px",
+      cursor: "pointer",
+      border: "none",
+      borderRight: "1px solid #2c5070",
+      background: page === "sim" ? "#2c5070" : "#1c3d57",
+      color: page === "sim" ? "#fff" : "#7aafd4",
+      fontWeight: page === "sim" ? 700 : 400,
+      fontFamily: "'DM Mono',monospace"
+    }
+  }, "Simulator"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setPage("docs"),
+    style: {
+      fontSize: 11,
+      padding: "4px 12px",
+      cursor: "pointer",
+      border: "none",
+      background: page === "docs" ? "#2c5070" : "#1c3d57",
+      color: page === "docs" ? "#fff" : "#7aafd4",
+      fontWeight: page === "docs" ? 700 : 400,
+      fontFamily: "'DM Mono',monospace"
+    }
+  }, "Physics & Methods")), page === "sim" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+    onClick: () => exportCSV(curves),
+    style: {
+      fontSize: 11,
+      padding: "4px 11px",
+      borderRadius: 5,
+      cursor: "pointer",
+      background: "#1c3d57",
+      color: "#7aafd4",
+      border: "1px solid #2c5070",
+      fontFamily: "'DM Mono',monospace"
+    }
+  }, "⬇ CSV"), /*#__PURE__*/React.createElement("button", {
+    onClick: exportSVG,
+    style: {
+      fontSize: 11,
+      padding: "4px 11px",
+      borderRadius: 5,
+      cursor: "pointer",
+      background: "#1c3d57",
+      color: "#7aafd4",
+      border: "1px solid #2c5070",
+      fontFamily: "'DM Mono',monospace"
+    }
+  }, "⬇ SVG"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setPanelOpen(o => !o),
+    style: {
+      fontSize: 11,
+      padding: "4px 11px",
+      borderRadius: 5,
+      cursor: "pointer",
+      background: "#1c3d57",
+      color: "#7aafd4",
+      border: "1px solid #2c5070",
+      fontFamily: "'DM Mono',monospace"
+    }
+  }, panelOpen ? "◀ Hide" : "▶ Show")), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setDark(d => !d),
+    style: {
+      fontSize: 15,
+      padding: "2px 8px",
+      borderRadius: 5,
+      cursor: "pointer",
+      background: "#1c3d57",
+      color: "#e0d090",
+      border: "1px solid #2c5070"
+    }
+  }, dark ? "☀" : "🌙"))), /*#__PURE__*/React.createElement(DisclaimerBanner, {
+    dark: dark
+  }), page === "docs" ? /*#__PURE__*/React.createElement(PhysicsDocsPage, {
+    dark: dark
+  }) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: T.subhead,
+      padding: "8px 24px",
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 20,
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#7aafd4",
+      fontFamily: "'DM Mono',monospace"
+    }
+  }, "μ", /*#__PURE__*/React.createElement("sub", {
+    style: {
+      fontSize: 9
+    }
+  }, "elec"), " = −5.055 + 0.059·pH"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#aac8e0",
+      fontFamily: "'DM Mono',monospace"
+    }
+  }, "Φ", /*#__PURE__*/React.createElement("sub", {
+    style: {
+      fontSize: 9
+    }
+  }, "total"), " = −Φ", /*#__PURE__*/React.createElement("sub", {
+    style: {
+      fontSize: 9
+    }
+  }, "WF"), " − μ", /*#__PURE__*/React.createElement("sub", {
+    style: {
+      fontSize: 9
+    }
+  }, "elec")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#c8dff0",
+      fontFamily: "'DM Mono',monospace",
+      background: "#1c3d57",
+      padding: "3px 10px",
+      borderRadius: 4
+    }
+  }, "μ = ", muElectrolyte(pH).toFixed(3), " eV \xA0|\xA0 Φ", /*#__PURE__*/React.createElement("sub", {
+    style: {
+      fontSize: 9
+    }
+  }, "WF"), " = ", WF.toFixed(2), " eV \xA0|\xA0", /*#__PURE__*/React.createElement("b", null, "Φ", /*#__PURE__*/React.createElement("sub", {
+    style: {
+      fontSize: 9
+    }
+  }, "total"), " = ", PhiDisp > 0 ? "+" : "", PhiDisp.toFixed(0), " mV"), !isMetal && /*#__PURE__*/React.createElement(React.Fragment, null, "\xA0|\xA0 V", /*#__PURE__*/React.createElement("sub", {
+    style: {
+      fontSize: 9
+    }
+  }, "fb"), " = ", V_fb.toFixed(2), " V vs SHE"), isMetal && /*#__PURE__*/React.createElement(React.Fragment, null, "\xA0|\xA0 ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "#b0d0e8"
+    }
+  }, "Metal — no SCR")))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 0,
+      padding: "10px 20px 0",
+      flexWrap: "wrap"
+    }
+  }, MODES.map(m => /*#__PURE__*/React.createElement("button", {
+    key: m.id,
+    onClick: () => setMode(m.id),
+    style: {
+      padding: "6px 13px",
+      fontSize: 11.5,
+      cursor: "pointer",
+      border: "1px solid " + T.border,
+      borderBottom: mode === m.id ? "2px solid " + T.accent : "1px solid " + T.border,
+      background: mode === m.id ? T.surface : T.bg,
+      color: mode === m.id ? T.text : T.muted,
+      fontWeight: mode === m.id ? 700 : 400,
+      borderRadius: "6px 6px 0 0",
+      marginRight: 3,
+      transition: "all 0.12s"
+    }
+  }, m.label))), /*#__PURE__*/React.createElement("div", {
+    ref: containerRef,
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 16,
+      padding: "0 20px 24px",
+      alignItems: "flex-start"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    ref: chartCardRef,
+    style: {
+      background: T.surface,
+      border: "1px solid " + T.border,
+      borderTop: "none",
+      borderRadius: "0 8px 8px 8px",
+      flex: "1 1 340px",
+      padding: "14px 10px 8px",
+      minWidth: 280,
+      boxShadow: "0 2px 12px rgba(0,0,0,0.10)",
+      transition: "background 0.25s"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 0,
+      marginBottom: 10,
+      borderRadius: 6,
+      overflow: "hidden",
+      border: "1px solid " + T.border,
+      width: "fit-content"
+    }
+  }, VIEW_TABS.map(v => /*#__PURE__*/React.createElement("button", {
+    key: v.id,
+    onClick: () => setShowBand(v.id === "band"),
+    style: {
+      padding: "4px 14px",
+      fontSize: 11,
+      cursor: "pointer",
+      border: "none",
+      borderRight: v.id === "phi" ? "1px solid " + T.border : "none",
+      background: activeView === v.id ? T.header : T.bg,
+      color: activeView === v.id ? T.headerTxt : T.muted,
+      fontWeight: activeView === v.id ? 700 : 400,
+      fontFamily: "'DM Mono',monospace",
+      transition: "all 0.1s"
+    }
+  }, v.label))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 10,
+      marginBottom: 10,
+      flexWrap: "wrap",
+      alignItems: "center",
+      fontSize: 10.5,
+      fontFamily: "'DM Mono',monospace"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: T.muted,
+      fontWeight: 700,
+      textTransform: "uppercase",
+      letterSpacing: "0.4px",
+      fontSize: 9.5
+    }
+  }, "Panels"), [{
+    on: showIons,
+    set: setShowIons,
+    label: "ions",
+    col: "#5a3080"
+  }, {
+    on: showRho,
+    set: setShowRho,
+    label: "\u03C1(x)",
+    col: "#c03020"
+  }, {
+    on: showField,
+    set: setShowField,
+    label: "|E(x)|",
+    col: "#1a6fa8"
+  }].map((p, i) => /*#__PURE__*/React.createElement("button", {
+    key: i,
+    onClick: () => p.set(!p.on),
+    style: {
+      padding: "3px 10px",
+      fontSize: 10.5,
+      cursor: "pointer",
+      borderRadius: 5,
+      border: "1px solid " + (p.on ? p.col : T.border),
+      background: p.on ? p.col : T.bg,
+      color: p.on ? "#fff" : T.muted,
+      fontWeight: p.on ? 700 : 400,
+      fontFamily: "'DM Mono',monospace",
+      transition: "all 0.12s",
+      display: "flex",
+      alignItems: "center",
+      gap: 5
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 9
+    }
+  }, p.on ? "\u25CF" : "\u25CB"), p.label))), /*#__PURE__*/React.createElement("div", {
+    id: "chart-svg-root"
+  }, showIons && curves.length > 0 && /*#__PURE__*/React.createElement(ChargeStrip, {
+    curves: curves,
+    xMin_nm: xMin_nm,
+    xMax_nm: xMax_nm,
+    width: chartW,
+    dark: dark,
+    isMetal: isMetal,
+    padL: activeView === "phi" ? 64 : 62,
+    padR: activeView === "phi" ? 18 : 64,
+    c0_M: Math.pow(10, logC0),
+    NA_cm3: Math.pow(10, logNA),
+    Temp: Temp,
+    sigmaRaw: sigmaRaw,
+    rIon_A: rIon_A,
+    rSolv_A: rSolv_A
+  }), showRho && curves.length > 0 && /*#__PURE__*/React.createElement(ChargeDensityChart, {
+    curves: curves,
+    xMin_nm: xMin_nm,
+    xMax_nm: xMax_nm,
+    width: chartW,
+    height: 82,
+    dark: dark,
+    isMetal: isMetal,
+    padL: activeView === "phi" ? 64 : 62,
+    padR: activeView === "phi" ? 18 : 64,
+    c0_M: Math.pow(10, logC0),
+    NA_cm3: Math.pow(10, logNA),
+    Temp: Temp
+  }), activeView === "phi" && /*#__PURE__*/React.createElement(PotentialChart, {
+    curves: curves,
+    yMin: yMin,
+    yMax: yMax,
+    xMin_nm: xMin_nm,
+    xMax_nm: xMax_nm,
+    width: chartW,
+    height: chartH,
+    dark: dark,
+    isMetal: isMetal,
+    setTooltip: setTooltip
+  }), activeView === "band" && !isMetal && /*#__PURE__*/React.createElement(BandDiagramChart_SC, {
+    curves: curves,
+    chi_eV: chi,
+    Eg_eV: Eg,
+    WF_eV: WF,
+    xMin_nm: xMin_nm,
+    xMax_nm: xMax_nm,
+    width: chartW,
+    height: bandH,
+    dark: dark,
+    setTooltip: setTooltip
+  }), activeView === "band" && isMetal && /*#__PURE__*/React.createElement(BandDiagramChart_Metal, {
+    curves: curves,
+    WF_eV: WF,
+    xMin_nm: xMin_nm,
+    xMax_nm: xMax_nm,
+    width: chartW,
+    height: bandH,
+    dark: dark,
+    setTooltip: setTooltip
+  }), showField && curves.length > 0 && /*#__PURE__*/React.createElement(ElectricFieldChart, {
+    curves: curves,
+    xMin_nm: xMin_nm,
+    xMax_nm: xMax_nm,
+    width: chartW,
+    height: 82,
+    dark: dark,
+    padL: activeView === "phi" ? 64 : 62,
+    padR: activeView === "phi" ? 18 : 64
+  })), mode !== "free" && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: "5px 14px",
+      marginTop: 8,
+      paddingLeft: 64
+    }
+  }, curves.map((c, i) => c.label && /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 5
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 20,
+      height: 3,
+      background: c.color,
+      borderRadius: 2
+    }
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10.5,
+      color: T.muted,
+      fontFamily: "'DM Mono',monospace"
+    },
+    dangerouslySetInnerHTML: {
+      __html: c.label.replace(/N_A=/g, "N<sub>A</sub>=").replace(/\^(\d+)/g, "<sup>$1</sup>").replace(/c₀=/g, "c<sub>0</sub>=")
+    }
+  })))), activeView === "band" && mode === "free" && !isMetal && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: "5px 14px",
+      marginTop: 8,
+      paddingLeft: 62
+    }
+  }, [{
+    color: "#7f3fbf",
+    dash: "6,3",
+    node: /*#__PURE__*/React.createElement("span", null, "E", /*#__PURE__*/React.createElement("sub", null, "vac"), " (solid, local)")
+  }, {
+    color: "#c0392b",
+    dash: "none",
+    node: /*#__PURE__*/React.createElement("span", null, "CBM")
+  }, {
+    color: "#2471a3",
+    dash: "none",
+    node: /*#__PURE__*/React.createElement("span", null, "VBM")
+  }, {
+    color: "#1e8449",
+    dash: "9,4",
+    node: /*#__PURE__*/React.createElement("span", null, "E", /*#__PURE__*/React.createElement("sub", null, "F"), " = μ", /*#__PURE__*/React.createElement("sub", null, "elec"))
+  }, {
+    color: "#1a8fc0",
+    dash: "8,4",
+    node: /*#__PURE__*/React.createElement("span", null, "E", /*#__PURE__*/React.createElement("sub", null, "vac"), "(liq bulk) = −4.44 eV")
+  }, {
+    color: "#1a8fc0",
+    dash: "4,3",
+    node: /*#__PURE__*/React.createElement("span", null, "λ", /*#__PURE__*/React.createElement("sub", null, "D"), " (Debye length)")
+  }].map((l, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 5
+    }
+  }, /*#__PURE__*/React.createElement("svg", {
+    width: 22,
+    height: 8
+  }, /*#__PURE__*/React.createElement("line", {
+    x1: 0,
+    y1: 4,
+    x2: 22,
+    y2: 4,
+    stroke: l.color,
+    strokeWidth: 2,
+    strokeDasharray: l.dash === "none" ? "" : l.dash
+  })), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10.5,
+      color: T.muted,
+      fontFamily: "'DM Sans',sans-serif"
+    }
+  }, l.node)))), activeView === "band" && mode === "free" && isMetal && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: "5px 14px",
+      marginTop: 8,
+      paddingLeft: 62
+    }
+  }, [{
+    color: "#7f3fbf",
+    dash: "6,3",
+    node: /*#__PURE__*/React.createElement("span", null, "E", /*#__PURE__*/React.createElement("sub", null, "vac"))
+  }, {
+    color: "#1e8449",
+    dash: "9,4",
+    node: /*#__PURE__*/React.createElement("span", null, "E", /*#__PURE__*/React.createElement("sub", null, "F"), " (flat, no SCR)")
+  }, {
+    color: "#1a8fc0",
+    dash: "8,4",
+    node: /*#__PURE__*/React.createElement("span", null, "E", /*#__PURE__*/React.createElement("sub", null, "vac"), "(liq bulk) = −4.44 eV")
+  }, {
+    color: "#1a8fc0",
+    dash: "4,3",
+    node: /*#__PURE__*/React.createElement("span", null, "λ", /*#__PURE__*/React.createElement("sub", null, "D"), " (Debye length)")
+  }, {
+    color: "#b0609f",
+    dash: "none",
+    node: /*#__PURE__*/React.createElement("span", null, "Φ", /*#__PURE__*/React.createElement("sub", null, "WF"), " bracket")
+  }].map((l, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 5
+    }
+  }, /*#__PURE__*/React.createElement("svg", {
+    width: 22,
+    height: 8
+  }, /*#__PURE__*/React.createElement("line", {
+    x1: 0,
+    y1: 4,
+    x2: 22,
+    y2: 4,
+    stroke: l.color,
+    strokeWidth: 2,
+    strokeDasharray: l.dash === "none" ? "" : l.dash
+  })), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10.5,
+      color: T.muted,
+      fontFamily: "'DM Sans',sans-serif"
+    }
+  }, l.node)))), mode === "free" && info && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12,
+      marginLeft: 4,
+      display: "flex",
+      gap: 8,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement(Pill, {
+    label: /*#__PURE__*/React.createElement("span", null, "μ", /*#__PURE__*/React.createElement("sub", null, "elec")),
+    value: info.mu,
+    unit: "eV vs vac",
+    color: "#6a3d9a",
+    dark: dark
+  }), /*#__PURE__*/React.createElement(Pill, {
+    label: /*#__PURE__*/React.createElement("span", null, "Φ", /*#__PURE__*/React.createElement("sub", null, "total")),
+    value: `${info.Phi > 0 ? "+" : ""}${info.Phi}`,
+    unit: "mV",
+    color: "#444",
+    dark: dark
+  }), /*#__PURE__*/React.createElement(Pill, {
+    label: /*#__PURE__*/React.createElement("span", null, "V", /*#__PURE__*/React.createElement("sub", null, "H")),
+    value: info.V_H,
+    unit: "mV",
+    color: "#1a6fa8",
+    dark: dark
+  }), !isMetal && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Pill, {
+    label: /*#__PURE__*/React.createElement("span", null, "φ", /*#__PURE__*/React.createElement("sub", null, "s"), " (bend)"),
+    value: info.phi_s,
+    unit: "mV",
+    color: "#2ca02c",
+    dark: dark
+  }), /*#__PURE__*/React.createElement(Pill, {
+    label: /*#__PURE__*/React.createElement("span", null, "W (depletion)"),
+    value: info.W,
+    unit: "nm",
+    color: "#d06a00",
+    dark: dark
+  }), info.V_diff != null && /*#__PURE__*/React.createElement(Pill, {
+    label: /*#__PURE__*/React.createElement("span", null, "V", /*#__PURE__*/React.createElement("sub", null, "diff")),
+    value: info.V_diff,
+    unit: "mV",
+    color: "#b0609f",
+    dark: dark
+  }), info.Q_ss_Cm2 != null && info.Q_ss_Cm2 !== 0 && (() => {
+    const q = fmtCharge(info.Q_ss_Cm2);
+    return /*#__PURE__*/React.createElement(Pill, {
+      label: /*#__PURE__*/React.createElement("span", null, "Q", /*#__PURE__*/React.createElement("sub", null, "ss"), " (traps)"),
+      value: q.val,
+      unit: q.unit,
+      color: "#0e7a6a",
+      dark: dark
+    });
+  })(), info.xi_surf != null && /*#__PURE__*/React.createElement(Pill, {
+    label: /*#__PURE__*/React.createElement("span", null, "E", /*#__PURE__*/React.createElement("sub", null, "F"), "−E", /*#__PURE__*/React.createElement("sub", null, "V"), " (surf)"),
+    value: info.xi_surf.toFixed(3),
+    unit: "eV",
+    color: "#0e7a6a",
+    dark: dark
+  }), /*#__PURE__*/React.createElement(Pill, {
+    label: /*#__PURE__*/React.createElement("span", null, "λ", /*#__PURE__*/React.createElement("sub", null, "D")),
+    value: curves[0]?.lambda_D_nm?.toFixed(2) ?? "—",
+    unit: "nm",
+    color: "#7a8fa8",
+    dark: dark
+  }), /*#__PURE__*/React.createElement(Pill, {
+    label: /*#__PURE__*/React.createElement("span", null, "V", /*#__PURE__*/React.createElement("sub", null, "fb")),
+    value: V_fb.toFixed(3),
+    unit: "V vs SHE",
+    color: "#c0392b",
+    dark: dark
+  })), isMetal && (() => {
+    const {
+      val,
+      unit
+    } = fmtCharge(info.Q_Cm2 ?? 0);
+    return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Pill, {
+      label: /*#__PURE__*/React.createElement("span", null, "σ", /*#__PURE__*/React.createElement("sub", null, "metal")),
+      value: val,
+      unit: unit,
+      color: "#5a3080",
+      dark: dark
+    }), info.V_diff != null && /*#__PURE__*/React.createElement(Pill, {
+      label: /*#__PURE__*/React.createElement("span", null, "V", /*#__PURE__*/React.createElement("sub", null, "diff")),
+      value: info.V_diff,
+      unit: "mV",
+      color: "#b0609f",
+      dark: dark
+    }), info.C_H != null && /*#__PURE__*/React.createElement(Pill, {
+      label: /*#__PURE__*/React.createElement("span", null, "C", /*#__PURE__*/React.createElement("sub", null, "H")),
+      value: info.C_H,
+      unit: "μF/cm²",
+      color: "#b0609f",
+      dark: dark
+    }));
+  })())), mode === "free" && panelOpen && /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: T.surface,
+      border: "1px solid " + T.border,
+      borderRadius: 8,
+      padding: "14px 16px",
+      flex: "0 0 260px",
+      minWidth: 220,
+      boxShadow: "0 2px 12px rgba(0,0,0,0.09)",
+      transition: "background 0.25s"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      fontWeight: 700,
+      color: T.text,
+      marginBottom: 14,
+      letterSpacing: "0.5px",
+      textTransform: "uppercase"
+    }
+  }, "Parameters"), /*#__PURE__*/React.createElement(SectionHead, {
+    label: "Electrolyte",
+    open: secOpen.elec,
+    onToggle: () => toggleSec("elec"),
+    dark: dark
+  }), secOpen.elec && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 8
+    }
+  }, /*#__PURE__*/React.createElement(Slider, {
+    label: "pH",
+    value: pH,
+    min: 0,
+    max: 14,
+    step: 0.1,
+    onChange: setPH,
+    format: v => v.toFixed(1),
+    unit: "",
+    ...sliderProps("#2ca02c"),
+    parse: s => parseFloat(s),
+    validate: v => v >= 0 && v <= 14
+  }), /*#__PURE__*/React.createElement(Slider, {
+    label: "log<sub>10</sub>(c<sub>0</sub> / M)",
+    value: logC0,
+    min: -6,
+    max: 0,
+    step: 0.05,
+    onChange: setLogC0,
+    format: fmtConc,
+    unit: "",
+    ...sliderProps("#d06a00"),
+    parse: s => {
+      const t = s.trim().toLowerCase();
+      const um = t.match(/^([0-9.e+\-]+)\s*[uµ]m$/);
+      if (um) return Math.log10(parseFloat(um[1]) * 1e-6);
+      const mm = t.match(/^([0-9.e+\-]+)\s*mm$/);
+      if (mm) return Math.log10(parseFloat(mm[1]) * 1e-3);
+      const mo = t.match(/^([0-9.e+\-]+)\s*m?$/);
+      if (mo) {
+        return Math.log10(parseFloat(mo[1]));
+      }
+      return parseFloat(t);
+    },
+    validate: v => v >= -6 && v <= 0
+  }), /*#__PURE__*/React.createElement(Slider, {
+    label: "r<sub>ion</sub> (bare radius)",
+    value: rIon_A,
+    min: 0.5,
+    max: 5.0,
+    step: 0.1,
+    onChange: setRIon_A,
+    format: v => v.toFixed(1),
+    unit: "Å",
+    ...sliderProps("#7a8fa8"),
+    parse: s => parseFloat(s),
+    validate: v => v >= 0.5 && v <= 5
+  }), /*#__PURE__*/React.createElement(Slider, {
+    label: "r<sub>solv</sub> (solvation shell)",
+    value: rSolv_A,
+    min: 1.0,
+    max: 8.0,
+    step: 0.1,
+    onChange: setRSolv_A,
+    format: v => v.toFixed(1),
+    unit: "Å",
+    ...sliderProps("#7a8fa8"),
+    parse: s => parseFloat(s),
+    validate: v => v >= 1 && v <= 8
+  }), !isMetal && /*#__PURE__*/React.createElement(Slider, {
+    label: "σ<sub>surf</sub> (×10<sup>13</sup> cm<sup>−2</sup>)",
+    value: sigmaRaw,
+    min: -100,
+    max: 100,
+    step: 0.5,
+    onChange: setSigmaRaw,
+    format: v => {
+      const a = Math.abs(v),
+        s = v < 0 ? "−" : v > 0 ? "+" : "";
+      return `${s}${a >= 10 ? a.toFixed(0) : a.toFixed(1)}×10¹³`;
+    },
+    unit: "cm⁻²",
+    ...sliderProps("#c0392b"),
+    parse: s => {
+      const v2 = parseFloat(s.trim().replace(/×/g, "*").replace(/\^/, "e"));
+      return !isNaN(v2) && Math.abs(v2) > 200 ? v2 / 1e13 : isNaN(v2) ? NaN : v2;
+    },
+    validate: v => v >= -100 && v <= 100
+  }), !isMetal && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      paddingTop: 8,
+      borderTop: "1px solid " + T.border
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginBottom: ssOn ? 8 : 0
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10.5,
+      color: T.muted,
+      fontWeight: 700,
+      textTransform: "uppercase",
+      letterSpacing: "0.4px",
+      fontFamily: "'DM Mono',monospace"
+    }
+  }, "Surface traps"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setSsOn(!ssOn),
+    style: {
+      padding: "3px 10px",
+      fontSize: 10,
+      cursor: "pointer",
+      borderRadius: 5,
+      border: "1px solid " + (ssOn ? "#0e7a6a" : T.border),
+      background: ssOn ? "#0e7a6a" : T.bg,
+      color: ssOn ? "#fff" : T.muted,
+      fontWeight: ssOn ? 700 : 400,
+      fontFamily: "'DM Mono',monospace"
+    }
+  }, ssOn ? "\u25CF on" : "\u25CB off")), ssOn && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      borderRadius: 5,
+      overflow: "hidden",
+      border: "1px solid " + T.border,
+      marginBottom: 8
+    }
+  }, [{
+    id: "acceptor",
+    l: "acceptor-like"
+  }, {
+    id: "donor",
+    l: "donor-like"
+  }].map(o => /*#__PURE__*/React.createElement("button", {
+    key: o.id,
+    onClick: () => setSsType(o.id),
+    style: {
+      flex: 1,
+      padding: "4px 6px",
+      fontSize: 10,
+      cursor: "pointer",
+      border: "none",
+      borderRight: o.id === "acceptor" ? "1px solid " + T.border : "none",
+      background: ssType === o.id ? "#0e7a6a" : T.bg,
+      color: ssType === o.id ? "#fff" : T.muted,
+      fontWeight: ssType === o.id ? 700 : 400,
+      fontFamily: "'DM Mono',monospace"
+    }
+  }, o.l))), /*#__PURE__*/React.createElement(Slider, {
+    label: "N",
+    value: logNss,
+    min: 9,
+    max: 15,
+    step: 0.1,
+    onChange: setLogNss,
+    format: v => "10^" + v.toFixed(1),
+    unit: "cm\u207B\u00B2",
+    ...sliderProps("#0e7a6a"),
+    parse: s => parseFloat(s),
+    validate: v => v >= 9 && v <= 15
+  }), /*#__PURE__*/React.createElement(Slider, {
+    label: "E",
+    value: Et_eV,
+    min: 0,
+    max: Eg,
+    step: 0.01,
+    onChange: setEt_eV,
+    format: v => v.toFixed(2),
+    unit: "eV above VBM",
+    ...sliderProps("#0e7a6a"),
+    parse: s => parseFloat(s),
+    validate: v => v >= 0 && v <= Eg
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: T.muted,
+      lineHeight: 1.5,
+      marginTop: 4,
+      fontFamily: "'DM Mono',monospace"
+    }
+  }, "f = 1/(1+exp((E", /*#__PURE__*/React.createElement("sub", null, "t"), "−ξ", /*#__PURE__*/React.createElement("sub", null, "surf"), ")/kT)); ξ", /*#__PURE__*/React.createElement("sub", null, "surf"), " = ξ", /*#__PURE__*/React.createElement("sub", null, "bulk"), " − φ", /*#__PURE__*/React.createElement("sub", null, "s"), /*#__PURE__*/React.createElement("br", null), ssType === "acceptor" ? "Q = \u2212e\u00B7N\u00B7f" : "Q = +e\u00B7N\u00B7(1\u2212f)", "  \u2014 large N pins E_F at E_t")))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      height: 10
+    }
+  }), /*#__PURE__*/React.createElement(SectionHead, {
+    label: isMetal ? "Metal" : "Semiconductor",
+    open: secOpen.electrode,
+    onToggle: () => toggleSec("electrode"),
+    dark: dark
+  }), secOpen.electrode && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 8
+    }
+  }, /*#__PURE__*/React.createElement(Slider, {
+    label: "Φ<sub>WF</sub> (eV vs vac)",
+    value: WF,
+    min: 0,
+    max: 10,
+    step: 0.01,
+    onChange: setWF,
+    format: v => v.toFixed(2),
+    unit: "eV",
+    ...sliderProps("#1a6fa8"),
+    parse: s => parseFloat(s),
+    validate: v => v >= 0 && v <= 10
+  }), !isMetal && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Slider, {
+    label: "log<sub>10</sub>(N<sub>A</sub> / cm<sup>−3</sup>)",
+    value: logNA,
+    min: 10,
+    max: 24,
+    step: 0.05,
+    onChange: setLogNA,
+    format: v => `10^${v.toFixed(1)}`,
+    unit: "cm⁻³",
+    ...sliderProps("#1a6fa8"),
+    parse: s => {
+      const t = s.trim();
+      const bare = parseFloat(t);
+      if (!isNaN(bare) && bare >= 10 && bare <= 24) return bare;
+      const sci = t.match(/^([0-9.]+)[×x\*]?10[\^e]([0-9]+)$/i);
+      if (sci) return Math.log10(parseFloat(sci[1])) + parseFloat(sci[2]);
+      if (!isNaN(bare)) return Math.log10(bare);
+      return NaN;
+    },
+    validate: v => v >= 10 && v <= 24
+  }), /*#__PURE__*/React.createElement(Slider, {
+    label: "ε<sub>r</sub> (electrode)",
+    value: epsRel,
+    min: 2,
+    max: 20,
+    step: 0.05,
+    onChange: setEpsRel,
+    format: v => v.toFixed(2),
+    unit: "",
+    ...sliderProps("#1a6fa8"),
+    parse: s => parseFloat(s),
+    validate: v => v >= 2 && v <= 20
+  })), isMetal && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 6
+    }
+  }, curves.length > 0 && (() => {
+    const as = curves[0]?.autoStern;
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginBottom: 8,
+        padding: "6px 10px",
+        borderRadius: 5,
+        background: as ? "rgba(176,96,159,0.13)" : T.surfaceB,
+        border: "1px solid " + (as ? "#b0609f" : T.border),
+        fontFamily: "'DM Mono',monospace",
+        fontSize: 10
+      }
+    }, as ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("b", {
+      style: {
+        color: "#b0609f"
+      }
+    }, "Stern layer active"), "  — ion packing limit reached. GCS model applied automatically.") : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("b", {
+      style: {
+        color: T.text
+      }
+    }, "Gouy-Chapman"), "  — surface concentration below packing limit."));
+  })(), /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: T.surfaceB,
+      borderRadius: 5,
+      border: "1px solid " + T.border,
+      padding: "8px 10px",
+      marginBottom: 8
+    }
+  }, /*#__PURE__*/React.createElement(Slider, {
+    label: "\u03B5",
+    value: sternEpsH,
+    min: 2,
+    max: 20,
+    step: 0.5,
+    onChange: setSternEpsH,
+    format: v => v.toFixed(1),
+    unit: "(Stern layer)",
+    ...sliderProps("#b0609f"),
+    parse: s => parseFloat(s),
+    validate: v => v >= 2 && v <= 20
+  }), curves.length > 0 && curves[0]?.autoStern && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: T.muted,
+      marginTop: 2,
+      fontFamily: "'DM Mono',monospace"
+    }
+  }, "C", /*#__PURE__*/React.createElement("sub", null, "H"), " = ", curves[0]?.C_H_uFcm2?.toFixed(1) ?? "—", " ", "\u03BCF/cm\u00B2")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: T.muted,
+      lineHeight: 1.55,
+      background: T.surfaceB,
+      padding: "6px 10px",
+      borderRadius: 5,
+      border: "1px solid " + T.border,
+      fontFamily: "'DM Mono',monospace"
+    }
+  }, "Auto-trigger: c", /*#__PURE__*/React.createElement("sub", null, "surf"), " = c₀·exp(e|V|/kT) ", ">", " n", /*#__PURE__*/React.createElement("sub", null, "max"), " = 1/(4√2·r", /*#__PURE__*/React.createElement("sub", null, "solv"), "³)"))), !isMetal && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      height: 10
+    }
+  }), /*#__PURE__*/React.createElement(SectionHead, {
+    label: "Band diagram",
+    open: secOpen.band,
+    onToggle: () => toggleSec("band"),
+    dark: dark
+  }), secOpen.band && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 8
+    }
+  }, /*#__PURE__*/React.createElement(Slider, {
+    label: "χ (electron affinity, eV)",
+    value: chi,
+    min: -2,
+    max: 5,
+    step: 0.01,
+    onChange: setChi,
+    format: v => `${v >= 0 ? "+" : ""}${v.toFixed(2)}`,
+    unit: "eV",
+    ...sliderProps("#7f3fbf"),
+    parse: s => parseFloat(s),
+    validate: v => v >= -2 && v <= 5
+  }), /*#__PURE__*/React.createElement(Slider, {
+    label: "E<sub>g</sub> (bandgap, eV)",
+    value: Eg,
+    min: 0.5,
+    max: 10,
+    step: 0.01,
+    onChange: setEg,
+    format: v => v.toFixed(2),
+    unit: "eV",
+    ...sliderProps("#7f3fbf"),
+    parse: s => parseFloat(s),
+    validate: v => v >= 0.5 && v <= 10
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      height: 10
+    }
+  }), /*#__PURE__*/React.createElement(SectionHead, {
+    label: "Environment",
+    open: secOpen.env,
+    onToggle: () => toggleSec("env"),
+    dark: dark
+  }), secOpen.env && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 8
+    }
+  }, /*#__PURE__*/React.createElement(Slider, {
+    label: "T",
+    value: Temp,
+    min: 250,
+    max: 400,
+    step: 1,
+    onChange: setTemp,
+    format: v => v.toFixed(0),
+    unit: "K",
+    ...sliderProps("#6a3d9a"),
+    parse: s => parseFloat(s),
+    validate: v => v >= 250 && v <= 400
+  }))), mode !== "free" && panelOpen && /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: T.surface,
+      border: "1px solid " + T.border,
+      borderRadius: 8,
+      padding: "14px 16px",
+      flex: "0 0 260px",
+      minWidth: 220,
+      boxShadow: "0 2px 12px rgba(0,0,0,0.09)",
+      transition: "background 0.25s"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      fontWeight: 700,
+      color: T.text,
+      marginBottom: 12,
+      letterSpacing: "0.5px",
+      textTransform: "uppercase"
+    }
+  }, "Shared parameters"), /*#__PURE__*/React.createElement(Slider, {
+    label: "pH",
+    value: pH,
+    min: 0,
+    max: 14,
+    step: 0.1,
+    onChange: setPH,
+    format: v => v.toFixed(1),
+    unit: "",
+    ...sliderProps("#2ca02c"),
+    parse: s => parseFloat(s),
+    validate: v => v >= 0 && v <= 14
+  }), /*#__PURE__*/React.createElement(Slider, {
+    label: "Φ<sub>WF</sub> (eV vs vac)",
+    value: WF,
+    min: 0,
+    max: 10,
+    step: 0.01,
+    onChange: setWF,
+    format: v => v.toFixed(2),
+    unit: "eV",
+    ...sliderProps("#1a6fa8"),
+    parse: s => parseFloat(s),
+    validate: v => v >= 0 && v <= 10
+  }), mode !== "doping" && /*#__PURE__*/React.createElement(Slider, {
+    label: "log<sub>10</sub>(N<sub>A</sub> / cm<sup>−3</sup>)",
+    value: logNA,
+    min: 10,
+    max: 24,
+    step: 0.05,
+    onChange: setLogNA,
+    format: v => `10^${v.toFixed(1)}`,
+    unit: "cm⁻³",
+    ...sliderProps("#1a6fa8"),
+    parse: s => {
+      const b = parseFloat(s.trim());
+      return !isNaN(b) && b >= 10 && b <= 24 ? b : Math.log10(b);
+    },
+    validate: v => v >= 10 && v <= 24
+  }), /*#__PURE__*/React.createElement(Slider, {
+    label: "log<sub>10</sub>(c<sub>0</sub> / M)",
+    value: logC0,
+    min: -6,
+    max: 0,
+    step: 0.05,
+    onChange: setLogC0,
+    format: fmtConc,
+    unit: "",
+    ...sliderProps("#d06a00"),
+    parse: s => {
+      const t = s.trim().toLowerCase();
+      const um = t.match(/^([0-9.e+\-]+)\s*[uµ]m$/);
+      if (um) return Math.log10(parseFloat(um[1]) * 1e-6);
+      const mm = t.match(/^([0-9.e+\-]+)\s*mm$/);
+      if (mm) return Math.log10(parseFloat(mm[1]) * 1e-3);
+      return Math.log10(parseFloat(t));
+    },
+    validate: v => v >= -6 && v <= 0
+  }), mode !== "sigma" && /*#__PURE__*/React.createElement(Slider, {
+    label: "σ<sub>surf</sub> (×10<sup>13</sup> cm<sup>−2</sup>)",
+    value: sigmaRaw,
+    min: -100,
+    max: 100,
+    step: 0.5,
+    onChange: setSigmaRaw,
+    format: v => {
+      const a = Math.abs(v),
+        s = v < 0 ? "−" : v > 0 ? "+" : "";
+      return `${s}${a >= 10 ? a.toFixed(0) : a.toFixed(1)}×10¹³`;
+    },
+    unit: "cm⁻²",
+    ...sliderProps("#c0392b"),
+    parse: s => {
+      const v2 = parseFloat(s.trim());
+      return Math.abs(v2) > 200 ? v2 / 1e13 : v2;
+    },
+    validate: v => v >= -100 && v <= 100
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderTop: "1px solid " + T.border,
+      margin: "12px 0 10px"
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      fontWeight: 700,
+      color: T.text,
+      marginBottom: 8,
+      letterSpacing: "0.5px",
+      textTransform: "uppercase"
+    }
+  }, "Series"), curves.map((c, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 8,
+      marginBottom: 7,
+      padding: "6px 10px",
+      background: T.surfaceB,
+      borderLeft: `3px solid ${c.color}`,
+      borderRadius: "0 5px 5px 0"
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      fontFamily: "'DM Mono',monospace",
+      color: T.text,
+      fontWeight: 600
+    },
+    dangerouslySetInnerHTML: {
+      __html: c.label.replace(/N_A=/g, "N<sub>A</sub>=").replace(/\^(\d+)/g, "<sup>$1</sup>").replace(/c₀=/g, "c<sub>0</sub>=")
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9.5,
+      color: T.muted,
+      marginTop: 1
+    }
+  }, "Φ=", (c.phiTotal * 1000).toFixed(0), " mV ·", " ", !isMetal && /*#__PURE__*/React.createElement(React.Fragment, null, "W=", c.W_nm.toFixed(1), " nm · "), "V", /*#__PURE__*/React.createElement("sub", {
+    style: {
+      fontSize: 8
+    }
+  }, "H"), "=", c.V_H_mV.toFixed(0), " mV")))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "6px 24px 14px",
+      fontSize: 9.5,
+      color: T.muted,
+      fontFamily: "'DM Mono',monospace",
+      borderTop: "1px solid " + T.border,
+      display: "flex",
+      gap: 16,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "ε_f = 78.4 ε₀ (H₂O)"), /*#__PURE__*/React.createElement("span", null, "μ_elec = −5.055 + 0.059·pH eV vs vac"), !isMetal && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("span", null, "Gouy-Chapman + Mott-Schottky SCR"), /*#__PURE__*/React.createElement("span", null, "V_fb = 4.44 − Φ_WF V vs SHE")), isMetal && /*#__PURE__*/React.createElement("span", null, "Metal: " + (curves[0]?.autoStern ? "Stern (GCS) auto — d=" + rSolv_A + "Å" : "Gouy-Chapman (GC)")), /*#__PURE__*/React.createElement("span", null, "E_vac(liq bulk) = Φ_total ≡ −4.44 eV vs vac"))), /*#__PURE__*/React.createElement(Tooltip, {
+    tooltip: tooltip,
+    dark: dark
+  }));
+}
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(React.createElement(DiamondInterface));
+  </script>
+</body>
+</html>
