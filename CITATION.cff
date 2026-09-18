@@ -1,0 +1,45 @@
+cff-version: 1.2.0
+message: "If you use this software or the underlying physical models, please cite the following papers."
+authors:
+  - family-names: "Chemin"
+    given-names: "Arsène"
+title: "Interactive model of the electrode–electrolyte junction"
+url: "https://arsenechemin.com"
+repository-code: "https://github.com"
+preferred-citation:
+  type: article
+  authors:
+    - family-names: "Chemin"
+      given-names: "A."
+    - family-names: "Godeffroy"
+      given-names: "L."
+    - family-names: "Amans"
+      given-names: "D."
+  title: "The role of the Helmholtz potential on electrocatalytic activity"
+  journal: "Nature Communications"
+  year: 2026
+  doi: "10.1038/s41467-026-70980-5"
+references:
+  - type: article
+    authors:
+      - family-names: "Chemin"
+        given-names: "A."
+      - family-names: "Godeffroy"
+        given-names: "L."
+      - family-names: "Rusu"
+        given-names: "M."
+      - family-names: "Drisch"
+        given-names: "M."
+      - family-names: "Finze"
+        given-names: "M."
+      - family-names: "Knittel"
+        given-names: "P."
+      - family-names: "Krueger"
+        given-names: "A."
+    title: "Modulating surface redox reactions and solvated electron emission on boron-doped diamond by (Photo) electrochemistry"
+    journal: "PRX Energy"
+    year: 2025
+    volume: 4
+    issue: 3
+    pages: "033011"
+    doi: "10.1103/PRXEnergy.4.033011"
